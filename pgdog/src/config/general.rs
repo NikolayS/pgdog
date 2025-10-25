@@ -150,6 +150,11 @@ pub struct General {
     /// Two-phase commit automatic transactions.
     #[serde(default)]
     pub two_phase_commit_auto: Option<bool>,
+    /// Authentication rate limit (attempts per minute per IP).
+    ///
+    /// None means unlimited (rate limiting disabled by default).
+    #[serde(default = "General::auth_rate_limit")]
+    pub auth_rate_limit: Option<u32>,
 }
 
 impl Default for General {
@@ -204,6 +209,7 @@ impl Default for General {
             two_phase_commit: bool::default(),
             two_phase_commit_auto: None,
             server_lifetime: Self::server_lifetime(),
+            auth_rate_limit: Self::auth_rate_limit(),
         }
     }
 }
@@ -465,6 +471,17 @@ impl General {
             "PGDOG_SERVER_LIFETIME",
             Duration::from_secs(3600 * 24).as_millis() as u64,
         )
+    }
+
+    pub fn auth_rate_limit() -> Option<u32> {
+        // Default: unlimited (None)
+        match std::env::var("PGDOG_AUTH_RATE_LIMIT") {
+            Ok(s) => s
+                .parse::<u32>()
+                .ok()
+                .and_then(|v| if v == 0 { None } else { Some(v) }),
+            Err(_) => None,
+        }
     }
 
     fn default_passthrough_auth() -> PassthoughAuth {
@@ -841,5 +858,20 @@ mod tests {
         env::remove_var("PGDOG_POOLER_MODE");
         env::remove_var("PGDOG_AUTH_TYPE");
         env::remove_var("PGDOG_DRY_RUN");
+    }
+
+    #[test]
+    fn test_auth_rate_limit_validation() {
+        // Test normal value
+        env::set_var("PGDOG_AUTH_RATE_LIMIT", "20");
+        assert_eq!(General::auth_rate_limit(), Some(20));
+
+        // Test zero disables limiting
+        env::set_var("PGDOG_AUTH_RATE_LIMIT", "0");
+        assert_eq!(General::auth_rate_limit(), None);
+
+        // Test default (unset) -> unlimited
+        env::remove_var("PGDOG_AUTH_RATE_LIMIT");
+        assert_eq!(General::auth_rate_limit(), None);
     }
 }

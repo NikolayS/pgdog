@@ -152,6 +152,11 @@ pub struct General {
     pub mirror_exposure: f32,
     #[serde(default)]
     pub auth_type: AuthType,
+    /// Authentication rate limit (attempts per minute per IP).
+    ///
+    /// None means unlimited (rate limiting disabled by default).
+    #[serde(default)]
+    pub auth_rate_limit: Option<u32>,
     /// Disable cross-shard queries.
     #[serde(default)]
     pub cross_shard_disabled: bool,
@@ -247,6 +252,7 @@ impl Default for General {
             mirror_queue: Self::mirror_queue(),
             mirror_exposure: Self::mirror_exposure(),
             auth_type: Self::auth_type(),
+            auth_rate_limit: None,
             cross_shard_disabled: Self::cross_shard_disabled(),
             dns_ttl: Self::default_dns_ttl(),
             pub_sub_channel_size: Self::pub_sub_channel_size(),

@@ -195,6 +195,21 @@ impl ProtocolState {
         self.queue.front() == Some(&ExecutionItem::Code(ExecutionCode::Copy))
     }
 
+    /// Remove one ReadyForQuery expectation from the queue.
+    ///
+    /// Called when the server enters COPY IN mode (sends CopyInResponse).
+    /// PostgreSQL ignores Sync during COPY IN (protocol spec §55.2.6),
+    /// so the ReadyForQuery that was expected from the initial
+    /// Bind+Execute+Sync will never arrive.  Leaving it in the queue
+    /// would desync the state machine on the next query.
+    pub(crate) fn remove_one_rfq(&mut self) {
+        if let Some(pos) = self.queue.iter().position(|item| {
+            matches!(item, ExecutionItem::Code(ExecutionCode::ReadyForQuery))
+        }) {
+            self.queue.remove(pos);
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -846,5 +861,77 @@ mod test {
         assert_eq!(state.action('C').unwrap(), Action::Forward);
         assert_eq!(state.action('Z').unwrap(), Action::Forward);
         assert!(state.is_empty());
+    }
+
+    // ========================================
+    // COPY Double-Sync Resilience Tests
+    // ========================================
+
+    /// Simulate a client that sends Bind+Execute+Sync for COPY FROM STDIN
+    /// (the tokio-postgres double-Sync bug).  PostgreSQL ignores Sync during
+    /// COPY IN mode, so only one ReadyForQuery is produced.  Without
+    /// remove_one_rfq() the state machine keeps a stale RFQ entry that
+    /// desyncs subsequent queries.
+    #[test]
+    fn test_copy_in_with_client_double_sync() {
+        let mut state = ProtocolState::default();
+
+        // Client sends Bind + Execute + Sync (the buggy pattern).
+        state.add('2'); // BindComplete
+        state.add(ExecutionCode::ExecutionCompleted); // from Execute
+        state.add('Z'); // ReadyForQuery from first Sync
+
+        // Server: BindComplete
+        assert_eq!(state.action('2').unwrap(), Action::Forward);
+        // Server: CopyInResponse — enters COPY mode, first Sync will be ignored.
+        assert_eq!(state.action('G').unwrap(), Action::Forward);
+        state.prepend('G'); // as forward() does
+        state.remove_one_rfq(); // drop the stale RFQ
+
+        // Queue should be [Copy] — no stale ReadyForQuery.
+        assert_eq!(state.len(), 1);
+        assert!(state.in_copy_mode());
+
+        // Client sends CopyDone (consumes the Copy entry).
+        assert_eq!(state.action('c').unwrap(), Action::Forward);
+
+        // Client sends second Sync (the real one with CopyDone).
+        state.add('Z');
+
+        // Server: CommandComplete + ReadyForQuery (one pair, not two).
+        assert_eq!(state.action('C').unwrap(), Action::Forward);
+        assert_eq!(state.action('Z').unwrap(), Action::Forward);
+
+        // Clean — no stale entries.
+        assert!(state.is_empty());
+    }
+
+    /// Same scenario WITHOUT the fix — demonstrates the desync.
+    #[test]
+    fn test_copy_in_double_sync_causes_stale_rfq_without_fix() {
+        let mut state = ProtocolState::default();
+
+        // Client: Bind + Execute + Sync
+        state.add('2');
+        state.add(ExecutionCode::ExecutionCompleted);
+        state.add('Z'); // stale RFQ
+
+        // Server: BindComplete, CopyInResponse
+        assert_eq!(state.action('2').unwrap(), Action::Forward);
+        assert_eq!(state.action('G').unwrap(), Action::Forward);
+        state.prepend('G');
+        // NOTE: no remove_one_rfq() here — demonstrating the bug
+
+        // Client: CopyDone + Sync
+        assert_eq!(state.action('c').unwrap(), Action::Forward);
+        state.add('Z');
+
+        // Server: CommandComplete + ReadyForQuery
+        assert_eq!(state.action('C').unwrap(), Action::Forward);
+        assert_eq!(state.action('Z').unwrap(), Action::Forward);
+
+        // BUG: queue still has a stale ReadyForQuery!
+        assert!(!state.is_empty(), "stale RFQ remains without the fix");
+        assert_eq!(state.len(), 1);
     }
 }

@@ -228,6 +228,10 @@ impl PreparedStatements {
 
             'G' => {
                 self.state.prepend('G'); // Next thing we'll see is a CopyFail or CopyDone.
+                // PostgreSQL ignores Sync during COPY IN (protocol spec §55.2.6).
+                // Remove the ReadyForQuery that was expected from the initial
+                // Bind+Execute+Sync — the server won't send it.
+                self.state.remove_one_rfq();
             }
 
             // Backend told us the copy is done.

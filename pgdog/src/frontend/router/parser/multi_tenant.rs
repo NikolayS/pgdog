@@ -83,9 +83,7 @@ impl<'a> MultiTenantCheck<'a> {
         let schemas = search_path.resolve();
 
         for schema in schemas {
-            let schema_table = self
-                .schema
-                .get(&(schema.to_owned(), table.name.to_string()));
+            let schema_table = self.schema.get(schema, table.name);
             if let Some(schema_table) = schema_table {
                 let has_tenant_id = schema_table.columns().contains_key(&self.config.column);
                 if !has_tenant_id {
@@ -110,11 +108,12 @@ impl<'a> MultiTenantCheck<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::schema::{columns::Column, Relation, Schema};
+    use crate::backend::schema::{columns::StatsColumn as Column, Relation, Schema};
+    use indexmap::IndexMap;
     use std::collections::HashMap;
 
     fn schema_with_tenant_column(column: &str) -> Schema {
-        let mut columns = HashMap::new();
+        let mut columns = IndexMap::new();
         columns.insert(
             column.to_string(),
             Column {
@@ -125,7 +124,11 @@ mod tests {
                 column_default: String::new(),
                 is_nullable: false,
                 data_type: "bigint".into(),
-            },
+                ordinal_position: 1,
+                is_primary_key: false,
+                foreign_keys: Vec::new(),
+            }
+            .into(),
         );
 
         let relation = Relation::test_table("public", "accounts", columns);

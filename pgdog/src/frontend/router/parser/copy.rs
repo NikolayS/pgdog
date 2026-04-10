@@ -72,6 +72,8 @@ pub struct CopyParser {
     sharded_column: usize,
     /// Schema shard.
     schema_shard: Option<Shard>,
+    /// String representing NULL values in text/CSV format.
+    null_string: String,
 }
 
 impl Default for CopyParser {
@@ -86,6 +88,7 @@ impl Default for CopyParser {
             sharded_table: None,
             sharded_column: 0,
             schema_shard: None,
+            null_string: "\\N".to_owned(),
         }
     }
 }
@@ -187,6 +190,7 @@ impl CopyParser {
             )))
         };
         parser.sharding_schema = cluster.sharding_schema();
+        parser.null_string = null_string;
 
         Ok(parser)
     }
@@ -224,17 +228,26 @@ impl CopyParser {
                         // Totally broken.
                         let record = record?;
 
-                        let shard = if let Some(table) = &self.sharded_table {
+                        // pg_dump text format uses `\.` as end-of-copy marker.
+                        let is_end_marker = record.len() == 1 && record.get(0) == Some("\\.");
+
+                        let shard = if is_end_marker {
+                            Shard::All
+                        } else if let Some(table) = &self.sharded_table {
                             let key = record
                                 .get(self.sharded_column)
                                 .ok_or(Error::NoShardingColumn)?;
 
-                            let ctx = ContextBuilder::new(table)
-                                .data(key)
-                                .shards(self.sharding_schema.shards)
-                                .build()?;
+                            if key == self.null_string {
+                                Shard::All
+                            } else {
+                                let ctx = ContextBuilder::new(table)
+                                    .data(key)
+                                    .shards(self.sharding_schema.shards)
+                                    .build()?;
 
-                            ctx.apply()?
+                                ctx.apply()?
+                            }
                         } else if let Some(schema_shard) = self.schema_shard.clone() {
                             schema_shard
                         } else {
@@ -247,12 +260,13 @@ impl CopyParser {
 
                 CopyStream::Binary(stream) => {
                     if self.headers {
-                        let header = stream.header()?;
-                        rows.push(CopyRow::new(
-                            &header.to_bytes()?,
-                            self.schema_shard.clone().unwrap_or(Shard::All),
-                        ));
-                        self.headers = false;
+                        if let Some(header) = stream.header()? {
+                            rows.push(CopyRow::new(
+                                &header.to_bytes()?,
+                                self.schema_shard.clone().unwrap_or(Shard::All),
+                            ));
+                            self.headers = false;
+                        }
                     }
 
                     for tuple in stream.tuples() {
@@ -411,6 +425,125 @@ mod test {
     }
 
     #[test]
+    fn test_copy_text_pg_dump_end_marker() {
+        // pg_dump generates text format COPY with `\.` as end-of-copy marker.
+        // This marker should be sent to all shards without extracting a sharding key.
+        let copy = "COPY sharded (id, value) FROM STDIN";
+        let stmt = parse(copy).unwrap();
+        let stmt = stmt.protobuf.stmts.first().unwrap();
+        let copy = match stmt.stmt.clone().unwrap().node.unwrap() {
+            NodeEnum::CopyStmt(copy) => copy,
+            _ => panic!("not a copy"),
+        };
+
+        let mut copy = CopyParser::new(&copy, &Cluster::new_test(&config())).unwrap();
+
+        let one = CopyData::new("1\tAlice\n".as_bytes());
+        let two = CopyData::new("6\tBob\n".as_bytes());
+        let end_marker = CopyData::new("\\.\n".as_bytes());
+
+        let sharded = copy.shard(&[one, two, end_marker]).unwrap();
+        assert_eq!(sharded.len(), 3);
+        assert_eq!(sharded[0].message().data(), b"1\tAlice\n");
+        assert_eq!(sharded[0].shard(), &Shard::Direct(0));
+        assert_eq!(sharded[1].message().data(), b"6\tBob\n");
+        assert_eq!(sharded[1].shard(), &Shard::Direct(1));
+        assert_eq!(sharded[2].message().data(), b"\\.\n");
+        assert_eq!(sharded[2].shard(), &Shard::All);
+    }
+
+    #[test]
+    fn test_copy_text_null_sharding_key() {
+        // pg_dump text format uses `\N` to represent NULL values.
+        // When the sharding key is NULL, route to all shards.
+        // When a non-sharding column is NULL, route normally based on the key.
+        let copy = "COPY sharded (id, value) FROM STDIN";
+        let stmt = parse(copy).unwrap();
+        let stmt = stmt.protobuf.stmts.first().unwrap();
+        let copy = match stmt.stmt.clone().unwrap().node.unwrap() {
+            NodeEnum::CopyStmt(copy) => copy,
+            _ => panic!("not a copy"),
+        };
+
+        let mut copy = CopyParser::new(&copy, &Cluster::new_test(&config())).unwrap();
+
+        let one = CopyData::new("1\tAlice\n".as_bytes());
+        let two = CopyData::new("\\N\tBob\n".as_bytes());
+        let three = CopyData::new("11\tCharlie\n".as_bytes());
+        let four = CopyData::new("6\t\\N\n".as_bytes());
+
+        let sharded = copy.shard(&[one, two, three, four]).unwrap();
+        assert_eq!(sharded.len(), 4);
+        assert_eq!(sharded[0].message().data(), b"1\tAlice\n");
+        assert_eq!(sharded[0].shard(), &Shard::Direct(0));
+        assert_eq!(sharded[1].message().data(), b"\\N\tBob\n");
+        assert_eq!(sharded[1].shard(), &Shard::All);
+        assert_eq!(sharded[2].message().data(), b"11\tCharlie\n");
+        assert_eq!(sharded[2].shard(), &Shard::Direct(1));
+        assert_eq!(sharded[3].message().data(), b"6\t\\N\n");
+        assert_eq!(sharded[3].shard(), &Shard::Direct(1));
+    }
+
+    #[test]
+    fn test_copy_text_composite_type_sharded() {
+        // Test the same composite type but with sharding enabled (using the sharded table from config)
+        let copy = "COPY sharded (id, value) FROM STDIN";
+        let stmt = parse(copy).unwrap();
+        let stmt = stmt.protobuf.stmts.first().unwrap();
+        let copy = match stmt.stmt.clone().unwrap().node.unwrap() {
+            NodeEnum::CopyStmt(copy) => copy,
+            _ => panic!("not a copy"),
+        };
+
+        let mut copy = CopyParser::new(&copy, &Cluster::new_test(&config())).unwrap();
+
+        // Row where the value contains a composite type with commas and quotes
+        let row = CopyData::new(b"1\t(,Annapolis,Maryland,\"United States\",)\n");
+        let sharded = copy.shard(&[row]).unwrap();
+
+        assert_eq!(sharded.len(), 1);
+
+        // The output should preserve the quotes exactly
+        assert_eq!(
+            sharded[0].message().data(),
+            b"1\t(,Annapolis,Maryland,\"United States\",)\n",
+            "Composite type quotes should be preserved in sharded COPY"
+        );
+    }
+
+    #[test]
+    fn test_copy_explicit_text_format() {
+        // Test with explicit FORMAT text (like during resharding)
+        let copy = r#"COPY "public"."entity_values" ("id", "value_location") FROM STDIN WITH (FORMAT text)"#;
+        let stmt = parse(copy).unwrap();
+        let stmt = stmt.protobuf.stmts.first().unwrap();
+        let copy_stmt = match stmt.stmt.clone().unwrap().node.unwrap() {
+            NodeEnum::CopyStmt(copy) => copy,
+            _ => panic!("not a copy"),
+        };
+
+        let mut copy = CopyParser::new(&copy_stmt, &Cluster::default()).unwrap();
+
+        // Verify it's using tab delimiter (text format default)
+        assert_eq!(
+            copy.delimiter(),
+            '\t',
+            "Text format should use tab delimiter"
+        );
+
+        // Row with composite type
+        let row = CopyData::new(b"1\t(,Annapolis,Maryland,\"United States\",)\n");
+        let sharded = copy.shard(&[row]).unwrap();
+
+        assert_eq!(sharded.len(), 1);
+        assert_eq!(
+            sharded[0].message().data(),
+            b"1\t(,Annapolis,Maryland,\"United States\",)\n",
+            "Explicit FORMAT text should preserve quotes"
+        );
+    }
+
+    #[test]
     fn test_copy_binary() {
         let copy = "COPY sharded (id, value) FROM STDIN (FORMAT 'binary')";
         let stmt = parse(copy).unwrap();
@@ -420,7 +553,7 @@ mod test {
             _ => panic!("not a copy"),
         };
 
-        let mut copy = CopyParser::new(&copy, &Cluster::default()).unwrap();
+        let mut copy = CopyParser::new(&copy, &Cluster::new_test(&config())).unwrap();
         assert!(copy.is_from);
         assert!(copy.headers);
         let mut data = b"PGCOPY".to_vec();
@@ -441,7 +574,10 @@ mod test {
         let sharded = copy.shard(&[header]).unwrap();
         assert_eq!(sharded.len(), 3);
         assert_eq!(sharded[0].message().data(), &data[..19]); // Header is 19 bytes long.
+        assert_eq!(sharded[0].shard(), &Shard::All);
         assert_eq!(sharded[1].message().data().len(), 2 + 4 + 8 + 4 + 3);
+        assert!(matches!(sharded[1].shard(), &Shard::Direct(_)));
         assert_eq!(sharded[2].message().data(), (-1_i16).to_be_bytes());
+        assert_eq!(sharded[2].shard(), &Shard::All)
     }
 }

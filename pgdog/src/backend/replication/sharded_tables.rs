@@ -1,5 +1,5 @@
 //! Tables sharded in the database.
-use pgdog_config::OmnishardedTable;
+use pgdog_config::{OmnishardedTable, SystemCatalogsBehavior};
 
 use crate::{
     config::{DataType, ShardedTable},
@@ -19,6 +19,8 @@ struct Inner {
     /// across all tables, i.e., 3 tables with the same data type
     /// and list/range/hash function.
     common_mapping: Option<CommonMapping>,
+    omnisharded_sticky: bool,
+    system_catalogs: SystemCatalogsBehavior,
 }
 
 #[derive(Debug)]
@@ -46,12 +48,22 @@ impl Default for ShardedTables {
 
 impl From<&[ShardedTable]> for ShardedTables {
     fn from(value: &[ShardedTable]) -> Self {
-        Self::new(value.to_vec(), vec![])
+        Self::new(
+            value.to_vec(),
+            vec![],
+            false,
+            SystemCatalogsBehavior::default(),
+        )
     }
 }
 
 impl ShardedTables {
-    pub fn new(tables: Vec<ShardedTable>, omnisharded_tables: Vec<OmnishardedTable>) -> Self {
+    pub fn new(
+        tables: Vec<ShardedTable>,
+        omnisharded_tables: Vec<OmnishardedTable>,
+        omnisharded_sticky: bool,
+        system_catalogs: SystemCatalogsBehavior,
+    ) -> Self {
         let mut common_mapping = HashSet::new();
         for table in &tables {
             common_mapping.insert((
@@ -79,6 +91,8 @@ impl ShardedTables {
                     .map(|table| (table.name, table.sticky_routing))
                     .collect(),
                 common_mapping,
+                omnisharded_sticky,
+                system_catalogs,
             }),
         }
     }
@@ -89,6 +103,19 @@ impl ShardedTables {
 
     pub fn omnishards(&self) -> &HashMap<String, bool> {
         &self.inner.omnisharded
+    }
+
+    pub fn is_omnisharded_sticky(&self, name: &str) -> Option<bool> {
+        self.omnishards().get(name).cloned()
+    }
+
+    pub fn is_omnisharded_sticky_default(&self) -> bool {
+        self.inner.omnisharded_sticky
+    }
+
+    /// System catalogs are to be joined across shards.
+    pub fn is_system_catalog_sharded(&self) -> bool {
+        self.inner.system_catalogs == SystemCatalogsBehavior::Sharded
     }
 
     /// The deployment has only one sharded table.

@@ -35,15 +35,14 @@ impl RoleDetector {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
-    use std::time::Duration;
-
-    use tokio::time::Instant;
+    use std::time::{Duration, SystemTime};
 
     use crate::backend::databases::User;
     use crate::backend::pool::lsn_monitor::LsnStats;
     use crate::backend::pool::{Address, Config, PoolConfig};
     use crate::backend::replication::publisher::Lsn;
     use crate::config::{LoadBalancingStrategy, ReadWriteSplit};
+    use pgdog_stats::LsnStats as StatsLsnStats;
 
     use super::super::ShardConfig;
     use super::*;
@@ -54,13 +53,15 @@ mod test {
                 host: host.into(),
                 port,
                 user: "pgdog".into(),
-                password: "pgdog".into(),
+                passwords: vec!["pgdog".into()],
                 database_name: "pgdog".into(),
                 ..Default::default()
             },
             config: Config {
-                role_detection,
-                ..Default::default()
+                inner: pgdog_stats::Config {
+                    role_detection,
+                    ..Config::default().inner
+                },
             },
         }
     }
@@ -82,13 +83,14 @@ mod test {
 
     fn set_lsn_stats(shard: &Shard, index: usize, replica: bool, lsn: i64) {
         let pools = shard.pools();
-        let stats = LsnStats {
+        let stats: LsnStats = StatsLsnStats {
             replica,
             lsn: Lsn::from_i64(lsn),
             offset_bytes: lsn,
-            fetched: Instant::now(),
+            fetched: SystemTime::now(),
             ..Default::default()
-        };
+        }
+        .into();
         *pools[index].inner().lsn_stats.write() = stats;
     }
 

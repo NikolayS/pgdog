@@ -73,4 +73,10 @@ pub enum Error {
 
     #[error("mapping missing: {0}")]
     MappingMissing(usize),
+
+    #[error("fast shutdown failed")]
+    FastShutdown,
+
+    #[error("replica lag")]
+    ReplicaLag,
 }

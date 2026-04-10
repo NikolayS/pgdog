@@ -28,12 +28,12 @@ impl QueryEngine {
             return Ok(true);
         }
 
-        let request = Request::new(*context.id);
+        let connect_route = connect_route.unwrap_or(context.client_request.route());
+
+        let request = Request::new(*context.id, connect_route.is_read());
 
         self.stats.waiting(request.created_at);
         self.comms.update_stats(self.stats);
-
-        let connect_route = connect_route.unwrap_or(context.client_request.route());
 
         let connected = match self.backend.connect(&request, connect_route).await {
             Ok(_) => {
@@ -45,8 +45,9 @@ impl QueryEngine {
                 //
                 // Used in case the client runs an advisory lock
                 // or another leaky transaction mode abstraction.
-                self.backend
-                    .lock(context.client_request.route().is_lock_session());
+                if let Some(true) = context.client_request.route().lock_session() {
+                    self.backend.lock(true);
+                }
 
                 self.debug_connected(context, false);
 
@@ -70,8 +71,13 @@ impl QueryEngine {
 
             Err(err) => {
                 self.stats.error();
+                let can_recover = self
+                    .backend
+                    .cluster()
+                    .map(|cluster| cluster.client_connection_recovery().can_recover())
+                    .unwrap_or_default();
 
-                if err.no_server() {
+                if err.no_server() && can_recover {
                     error!("{} [{:?}]", err, context.stream.peer_addr());
 
                     let error = ErrorResponse::from_err(&err);

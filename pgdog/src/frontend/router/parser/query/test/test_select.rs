@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+use std::ops::Deref;
+
+use crate::config::{self, config};
 use crate::frontend::router::parser::{DistinctBy, DistinctColumn, Shard};
 use crate::net::messages::Parameter;
 
@@ -146,4 +150,113 @@ fn test_cte_write() {
     .into()]);
 
     assert!(command.route().is_write());
+}
+
+#[test]
+fn test_omnisharded_sticky_config_enabled() {
+    let mut updated = config().deref().clone();
+    updated.config.general.omnisharded_sticky = true;
+    config::set(updated).unwrap();
+
+    let mut test = QueryParserTest::new_with_config(&config());
+
+    let mut shards_seen = HashSet::new();
+    let q = "SELECT sharded_omni.* FROM sharded_omni WHERE sharded_omni.id = 1";
+
+    for _ in 0..10 {
+        let command = test.execute(vec![Query::new(q).into()]);
+        assert!(matches!(command.route().shard(), Shard::Direct(_)));
+        shards_seen.insert(command.route().shard().clone());
+    }
+
+    assert_eq!(
+        shards_seen.len(),
+        1,
+        "with omnisharded_sticky=true, all queries to sharded_omni should go to the same shard"
+    );
+
+    let mut updated = config().deref().clone();
+    updated.config.general.omnisharded_sticky = false;
+    config::set(updated).unwrap();
+}
+
+#[test]
+fn test_omnisharded_sticky_config_disabled() {
+    let mut updated = config().deref().clone();
+    updated.config.general.omnisharded_sticky = false;
+    config::set(updated).unwrap();
+
+    let mut test = QueryParserTest::new_with_config(&config());
+
+    let mut shards_seen = HashSet::new();
+    let q = "SELECT sharded_omni.* FROM sharded_omni WHERE sharded_omni.id = 1";
+
+    for _ in 0..10 {
+        let command = test.execute(vec![Query::new(q).into()]);
+        assert!(matches!(command.route().shard(), Shard::Direct(_)));
+        shards_seen.insert(command.route().shard().clone());
+    }
+
+    assert_eq!(
+        shards_seen.len(),
+        2,
+        "with omnisharded_sticky=false, queries should be load-balanced across shards"
+    );
+}
+
+#[test]
+fn test_system_catalog_sharded() {
+    use pgdog_config::SystemCatalogsBehavior;
+
+    let mut updated = config().deref().clone();
+    updated.config.general.system_catalogs = SystemCatalogsBehavior::Sharded;
+    config::set(updated).unwrap();
+
+    let mut test = QueryParserTest::new_with_config(&config());
+
+    let command = test.execute(vec![Query::new("SELECT * FROM pg_class").into()]);
+    assert_eq!(
+        command.route().shard(),
+        &Shard::All,
+        "system catalog query with Sharded behavior should go to all shards"
+    );
+
+    let command = test.execute(vec![Query::new(
+        "SELECT * FROM pg_type WHERE typname = 'int4'",
+    )
+    .into()]);
+    assert_eq!(
+        command.route().shard(),
+        &Shard::All,
+        "system catalog query with WHERE clause should still go to all shards"
+    );
+
+    // Reset to default
+    let mut updated = config().deref().clone();
+    updated.config.general.system_catalogs = SystemCatalogsBehavior::default();
+    config::set(updated).unwrap();
+}
+
+#[test]
+fn test_system_catalog_omnisharded_default() {
+    use pgdog_config::SystemCatalogsBehavior;
+
+    let mut updated = config().deref().clone();
+    updated.config.general.system_catalogs = SystemCatalogsBehavior::OmnishardedSticky;
+    config::set(updated).unwrap();
+
+    let mut test = QueryParserTest::new_with_config(&config());
+
+    // Without Sharded mode, system catalog queries use omnisharded routing
+    // (goes to a single shard, not all shards)
+    let command = test.execute(vec![Query::new("SELECT * FROM pg_class").into()]);
+    assert!(
+        matches!(command.route().shard(), Shard::Direct(_)),
+        "system catalog query with OmnishardedSticky should go to a single shard, not Shard::All"
+    );
+
+    // Reset to default
+    let mut updated = config().deref().clone();
+    updated.config.general.system_catalogs = SystemCatalogsBehavior::default();
+    config::set(updated).unwrap();
 }

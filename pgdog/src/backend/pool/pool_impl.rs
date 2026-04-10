@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::try_join_all;
 use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::RwLock;
 use parking_lot::{lock_api::MutexGuard, Mutex, RawMutex};
@@ -18,8 +19,10 @@ use crate::net::{Parameter, Parameters};
 
 use super::inner::CheckInResult;
 use super::{
-    lb::TargetHealth, lsn_monitor::LsnMonitor, Address, Comms, Config, Error, Guard, Healtcheck,
-    Inner, Monitor, Oids, PoolConfig, Request, State, Waiting,
+    lb::TargetHealth,
+    lsn_monitor::{LsnMonitor, ReplicaLag},
+    Address, Comms, Config, Error, Guard, Healtcheck, Inner, Monitor, Oids, PoolConfig, Request,
+    State, Waiting,
 };
 
 static ID_COUNTER: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0)));
@@ -135,6 +138,11 @@ impl Pool {
                 if conn.is_some() {
                     guard.stats.counts.wait_time += elapsed;
                     guard.stats.counts.server_assignment_count += 1;
+                    if request.read {
+                        guard.stats.counts.reads += 1;
+                    } else {
+                        guard.stats.counts.writes += 1;
+                    }
                 }
 
                 (conn, granted_at, guard.paused)
@@ -144,11 +152,7 @@ impl Pool {
                 self.comms().ready.notified().await;
             }
 
-            let (server, granted_at) = if let Some(mut server) = server {
-                server
-                    .prepared_statements_mut()
-                    .set_capacity(self.inner.config.prepared_statements_limit);
-                server.set_pooler_mode(self.inner.config.pooler_mode);
+            let (mut server, granted_at) = if let Some(server) = server {
                 (Guard::new(pool, server, granted_at), granted_at)
             } else {
                 // Slow path, pool is empty, will create new connection
@@ -156,6 +160,11 @@ impl Pool {
                 let mut waiting = Waiting::new(pool, request)?;
                 waiting.wait().await?
             };
+
+            server
+                .prepared_statements_mut()
+                .set_capacity(self.inner.config.prepared_statements_limit);
+            server.set_pooler_mode(self.inner.config.pooler_mode);
 
             match self
                 .maybe_healthcheck(
@@ -220,13 +229,15 @@ impl Pool {
         let now = if server.pooler_mode() == &PoolerMode::Session {
             Instant::now()
         } else {
-            server.stats().last_used
+            server.stats().last_used()
         };
 
         let counts = {
             let stats = server.stats_mut();
-            stats.client_id = None;
-            stats.reset_last_checkout()
+            stats.clear_client_id();
+            let counts = stats.reset_last_checkout();
+            stats.update();
+            counts
         };
 
         // Check everything and maybe check the connection
@@ -234,7 +245,7 @@ impl Pool {
         let CheckInResult {
             server_error,
             replenish,
-        } = { self.lock().maybe_check_in(server, now, counts)? };
+        } = { self.lock().maybe_check_in(server, now, counts, false)? };
 
         if server_error {
             error!(
@@ -300,7 +311,6 @@ impl Pool {
             to_guard.set_taken(taken);
         }
 
-        destination.launch();
         self.shutdown();
 
         Ok(())
@@ -317,6 +327,18 @@ impl Pool {
 
         guard.paused = true;
         guard.dump_idle();
+    }
+
+    /// Send a cancellation request for all running queries.
+    pub async fn cancel_all(&self) -> Result<(), Error> {
+        let taken = self.lock().checked_out_server_ids();
+        let addr = self.addr().clone();
+
+        try_join_all(taken.iter().map(|id| Server::cancel(&addr, id)))
+            .await
+            .map_err(|_| Error::FastShutdown)?;
+
+        Ok(())
     }
 
     /// Resume the pool.
@@ -414,6 +436,11 @@ impl Pool {
     /// Pool state.
     pub fn state(&self) -> State {
         State::get(self)
+    }
+
+    /// Get replica lag real quick.
+    pub fn replica_lag(&self) -> ReplicaLag {
+        self.lock().replica_lag
     }
 
     /// LSN stats

@@ -4,12 +4,17 @@ use pg_query::protobuf::ParseResult;
 use pg_query::Node;
 use pgdog_config::QueryParserEngine;
 
+use crate::backend::schema::Schema;
 use crate::backend::ShardingSchema;
+use crate::frontend::router::parser::AstContext;
 use crate::frontend::PreparedStatements;
+use crate::net::parameter::ParameterValue;
 
 pub mod aggregate;
+pub mod auto_id;
 pub mod error;
 pub mod insert;
+pub mod offset;
 pub mod plan;
 pub mod simple_prepared;
 pub mod unique_id;
@@ -36,6 +41,12 @@ pub struct StatementRewriteContext<'a> {
     pub prepared_statements: &'a mut PreparedStatements,
     /// Sharding schema.
     pub schema: &'a ShardingSchema,
+    /// Database schema with table/column info.
+    pub db_schema: &'a Schema,
+    /// User name for search_path resolution.
+    pub user: &'a str,
+    /// Search path for table lookups.
+    pub search_path: Option<&'a ParameterValue>,
 }
 
 #[derive(Debug)]
@@ -55,6 +66,12 @@ pub struct StatementRewrite<'a> {
     prepared_statements: &'a mut PreparedStatements,
     /// Sharding schema for cache lookups.
     schema: &'a ShardingSchema,
+    /// Database schema with table/column info.
+    db_schema: &'a Schema,
+    /// User name for search_path resolution.
+    user: &'a str,
+    /// Search path for table lookups.
+    search_path: Option<&'a ParameterValue>,
 }
 
 impl<'a> StatementRewrite<'a> {
@@ -70,6 +87,19 @@ impl<'a> StatementRewrite<'a> {
             prepared: ctx.prepared,
             prepared_statements: ctx.prepared_statements,
             schema: ctx.schema,
+            db_schema: ctx.db_schema,
+            user: ctx.user,
+            search_path: ctx.search_path,
+        }
+    }
+
+    /// Create an AstContext from this rewriter's fields.
+    fn ast_context(&self) -> AstContext<'a> {
+        AstContext {
+            sharding_schema: self.schema.clone(),
+            db_schema: self.db_schema.clone(),
+            user: self.user,
+            search_path: self.search_path,
         }
     }
 
@@ -89,6 +119,11 @@ impl<'a> StatementRewrite<'a> {
             plan.prepares = prepared_result.prepares;
         }
 
+        // Inject pgdog.unique_id() for missing BIGINT primary keys.
+        // This must run BEFORE the unique_id rewriter so the injected
+        // function calls get processed.
+        self.inject_auto_id(&mut plan)?;
+
         // Track the next parameter number to use
         let mut next_param = plan.params as i32 + 1;
 
@@ -106,6 +141,7 @@ impl<'a> StatementRewrite<'a> {
         })?;
 
         self.rewrite_aggregates(&mut plan)?;
+        self.limit_offset(&mut plan)?;
 
         if self.rewritten {
             plan.stmt = Some(match self.schema.query_parser_engine {

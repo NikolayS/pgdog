@@ -126,11 +126,12 @@ impl<'a> UpdateMulti<'a> {
                 return Ok(());
             }
 
-            if !context.in_transaction() && !self.engine.backend.is_multishard()
+            if !context.in_transaction() || !self.engine.backend.is_multishard()
             // Do this check at the last possible moment.
             // Just in case we change how transactions are
             // routed in the future.
             {
+                self.engine.cleanup_backend(context)?;
                 return Err(UpdateError::TransactionRequired.into());
             }
 
@@ -171,11 +172,11 @@ impl<'a> UpdateMulti<'a> {
         let mut checker = ForwardCheck::new(context.client_request);
 
         while self.engine.backend.has_more_messages() {
-            let message = self.engine.read_server_message(context).await?;
+            let message = self.engine.read_server_message().await?;
             let code = message.code();
 
             if code == 'E' {
-                return Err(Error::Execution(ErrorResponse::try_from(message)?));
+                return Err(ErrorResponse::try_from(message)?.into());
             }
 
             if forward_reply && checker.forward(code) {
@@ -201,7 +202,7 @@ impl<'a> UpdateMulti<'a> {
             .await?;
 
         while self.engine.backend.has_more_messages() {
-            let message = self.engine.read_server_message(context).await?;
+            let message = self.engine.read_server_message().await?;
             self.engine.process_server_message(context, message).await?;
         }
 
@@ -228,21 +229,21 @@ impl<'a> UpdateMulti<'a> {
 
         self.engine
             .backend
-            .handle_client_request(&mut request, &mut Router::default(), false)
+            .handle_client_request(&request, &mut Router::default(), false)
             .await?;
 
         let mut row = Row::default();
         let mut rows = 0;
 
         while self.engine.backend.has_more_messages() {
-            let message = self.engine.read_server_message(context).await?;
+            let message = self.engine.read_server_message().await?;
             match message.code() {
                 'D' => {
                     row.data_row = DataRow::try_from(message)?;
                     rows += 1;
                 }
                 'T' => row.row_description = RowDescription::try_from(message)?,
-                'E' => return Err(Error::Execution(ErrorResponse::try_from(message)?)),
+                'E' => return Err(ErrorResponse::try_from(message)?.into()),
                 _ => (),
             }
         }

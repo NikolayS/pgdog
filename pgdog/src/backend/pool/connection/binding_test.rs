@@ -49,7 +49,7 @@ mod tests {
         ];
 
         let route = Route::write(ShardWithPriority::new_default_unset(Shard::All));
-        let multishard = MultiShard::new(3, &route);
+        let multishard = MultiShard::new(vec![0, 1, 2], &route);
 
         let mut binding = Binding::MultiShard(guards, Box::new(multishard));
 
@@ -113,7 +113,7 @@ mod tests {
 
         // Should succeed
         if let Err(ref error) = result {
-            println!("Error in test_two_pc_phase1_prepare: {:?}", error);
+            eprintln!("Error in test_two_pc_phase1_prepare: {:?}", error);
         }
         assert!(result.is_ok());
 

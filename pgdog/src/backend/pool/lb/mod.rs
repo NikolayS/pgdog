@@ -2,21 +2,21 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use rand::seq::SliceRandom;
-use tokio::{
-    sync::Notify,
-    time::{timeout, Instant},
-};
+use tokio::{sync::Notify, time::timeout};
 use tracing::warn;
 
-use crate::config::{LoadBalancingStrategy, ReadWriteSplit, Role};
 use crate::net::messages::BackendKeyData;
+use crate::{
+    config::{LoadBalancingStrategy, ReadWriteSplit, Role},
+    net::Parameters,
+};
 
 use super::{Error, Guard, Pool, PoolConfig, Request};
 
@@ -38,6 +38,8 @@ pub struct Target {
     pub ban: Ban,
     replica: Arc<AtomicBool>,
     pub health: TargetHealth,
+    /// Smooth weighted round-robin current weight tracker.
+    current_weight: Arc<AtomicI64>,
 }
 
 impl Target {
@@ -48,6 +50,7 @@ impl Target {
             replica: Arc::new(AtomicBool::new(role == Role::Replica)),
             health: pool.inner().health.clone(),
             pool,
+            current_weight: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -160,7 +163,7 @@ impl LoadBalancer {
         // The old primary is still part of the config and will be demoted
         // to replica. If it's down, it will be banned from serving traffic.
         //
-        let now = Instant::now();
+        let now = SystemTime::now();
         targets.sort_by_cached_key(|target| target.0.lsn_age(now));
 
         let primary = targets
@@ -193,6 +196,11 @@ impl LoadBalancer {
         Monitor::spawn(self);
     }
 
+    /// Check that the load balancer targets are all launched.
+    pub fn online(&self) -> bool {
+        self.targets.iter().all(|target| target.pool.lock().online)
+    }
+
     /// Get a live connection from the pool.
     pub async fn get(&self, request: &Request) -> Result<Guard, Error> {
         match timeout(self.checkout_timeout, self.get_internal(request)).await {
@@ -200,6 +208,15 @@ impl LoadBalancer {
             Ok(Err(err)) => Err(err),
             Err(_) => Err(Error::ReplicaCheckoutTimeout),
         }
+    }
+
+    /// Get parameters from first non-banned connection pool.
+    pub async fn params(&self, request: &Request) -> Result<&Parameters, Error> {
+        if let Some(target) = self.targets.iter().find(|target| !target.ban.banned()) {
+            return target.pool.params(request).await;
+        }
+
+        Err(Error::AllReplicasDown)
     }
 
     /// Move connections from this replica set to another.
@@ -259,12 +276,19 @@ impl LoadBalancer {
         use LoadBalancingStrategy::*;
         use ReadWriteSplit::*;
 
-        let mut candidates: Vec<&Target> = self.targets.iter().collect();
+        let mut candidates: Vec<&Target> = self
+            .targets
+            .iter()
+            .filter(|target| !target.pool.config().resharding_only) // Don't let reads on resharding-only replicas.
+            .collect();
 
         let primary_reads = match self.rw_split {
             IncludePrimary => true,
             IncludePrimaryIfReplicaBanned => candidates.iter().any(|target| target.ban.banned()),
-            ExcludePrimary => false,
+            // we read from the primary if we have no replicas
+            ExcludePrimary => !candidates
+                .iter()
+                .any(|target| target.role() == Role::Replica),
         };
 
         if !primary_reads {
@@ -285,7 +309,34 @@ impl LoadBalancer {
                 candidates = reshuffled;
             }
             LeastActiveConnections => {
-                candidates.sort_by_cached_key(|target| target.pool.lock().idle());
+                candidates.sort_by_cached_key(|target| target.pool.lock().checked_out());
+            }
+            WeightedRoundRobin => {
+                let total_weight: i64 = candidates
+                    .iter()
+                    .map(|target| target.pool.config().lb_weight as i64)
+                    .sum();
+
+                if total_weight > 0 {
+                    for target in &candidates {
+                        target
+                            .current_weight
+                            .fetch_add(target.pool.config().lb_weight as i64, Ordering::Relaxed);
+                    }
+
+                    let max_idx = candidates
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, t)| t.current_weight.load(Ordering::Relaxed))
+                        .map(|(idx, _)| idx)
+                        .unwrap_or_default();
+
+                    candidates[max_idx]
+                        .current_weight
+                        .fetch_sub(total_weight, Ordering::Relaxed);
+
+                    candidates.swap(0, max_idx);
+                }
             }
         }
 

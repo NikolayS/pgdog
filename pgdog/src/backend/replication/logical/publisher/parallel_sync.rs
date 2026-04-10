@@ -11,10 +11,17 @@ use tokio::{
         mpsc::{unbounded_channel, UnboundedSender},
         Semaphore,
     },
+    task::JoinHandle,
 };
+use tracing::info;
 
 use super::super::Error;
-use crate::backend::{pool::Address, replication::publisher::Table, Cluster, Pool};
+use super::AbortSignal;
+use crate::backend::{
+    pool::Address,
+    replication::{publisher::Table, status::TableCopy},
+    Cluster, Pool,
+};
 
 struct ParallelSync {
     table: Table,
@@ -26,8 +33,11 @@ struct ParallelSync {
 
 impl ParallelSync {
     // Run parallel sync.
-    pub fn run(mut self) {
+    pub fn run(mut self) -> JoinHandle<Result<(), Error>> {
         spawn(async move {
+            // Record copy in queue before waiting for permit.
+            let tracker = TableCopy::new(&self.table.table.schema, &self.table.table.name);
+
             // This won't acquire until we have at least 1 available permit.
             // Permit will be given back when this task completes.
             let _permit = self
@@ -36,9 +46,22 @@ impl ParallelSync {
                 .await
                 .map_err(|_| Error::ParallelConnection)?;
 
-            let result = match self.table.data_sync(&self.addr, &self.dest).await {
+            if self.tx.is_closed() {
+                return Err(Error::DataSyncAborted);
+            }
+
+            let abort = AbortSignal::new(self.tx.clone());
+
+            let result = match self
+                .table
+                .data_sync(&self.addr, &self.dest, abort, &tracker)
+                .await
+            {
                 Ok(_) => Ok(self.table),
-                Err(err) => Err(err),
+                Err(err) => {
+                    tracker.error(&err);
+                    return Err(err);
+                }
             };
 
             self.tx
@@ -46,7 +69,7 @@ impl ParallelSync {
                 .map_err(|_| Error::ParallelConnection)?;
 
             Ok::<(), Error>(())
-        });
+        })
     }
 }
 
@@ -75,6 +98,11 @@ impl ParallelSyncManager {
 
     /// Run parallel table sync and return table LSNs when everything is done.
     pub async fn run(self) -> Result<Vec<Table>, Error> {
+        info!(
+            "starting parallel table copy using {} replicas",
+            self.replicas.len()
+        );
+
         let mut replicas_iter = self.replicas.iter();
         // Loop through replicas, one at a time.
         // This works around Rust iterators not having a "rewind" function.
@@ -88,23 +116,29 @@ impl ParallelSyncManager {
 
         let (tx, mut rx) = unbounded_channel();
         let mut tables = vec![];
+        let mut handles = vec![];
 
         for table in self.tables {
-            ParallelSync {
-                table,
-                addr: replica.addr().clone(),
-                dest: self.dest.clone(),
-                tx: tx.clone(),
-                permit: self.permit.clone(),
-            }
-            .run();
+            handles.push(
+                ParallelSync {
+                    table,
+                    addr: replica.addr().clone(),
+                    dest: self.dest.clone(),
+                    tx: tx.clone(),
+                    permit: self.permit.clone(),
+                }
+                .run(),
+            );
         }
 
         drop(tx);
 
         while let Some(table) = rx.recv().await {
-            let table = table?;
-            tables.push(table);
+            tables.push(table?);
+        }
+
+        for handle in handles {
+            handle.await??;
         }
 
         Ok(tables)

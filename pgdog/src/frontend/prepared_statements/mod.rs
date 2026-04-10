@@ -10,7 +10,6 @@ use tracing::debug;
 use crate::{
     config::{config, PreparedStatements as PreparedStatementsLevel},
     net::{Parse, ProtocolMessage},
-    stats::memory::MemoryUsage,
 };
 
 pub mod error;
@@ -23,21 +22,18 @@ pub use rewrite::Rewrite;
 
 static CACHE: Lazy<PreparedStatements> = Lazy::new(PreparedStatements::default);
 
+/// Approximate memory used by a String.
+#[inline]
+fn str_mem(s: &str) -> usize {
+    s.len() + std::mem::size_of::<String>()
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedStatements {
     pub(super) global: Arc<RwLock<GlobalCache>>,
     pub(super) local: HashMap<String, String>,
     pub(super) level: PreparedStatementsLevel,
     pub(super) memory_used: usize,
-}
-
-impl MemoryUsage for PreparedStatements {
-    #[inline]
-    fn memory_usage(&self) -> usize {
-        self.local.memory_usage()
-            + std::mem::size_of::<PreparedStatementsLevel>()
-            + std::mem::size_of::<Arc<RwLock<GlobalCache>>>()
-    }
 }
 
 impl Default for PreparedStatements {
@@ -72,16 +68,20 @@ impl PreparedStatements {
     /// Register prepared statement with the global cache.
     pub fn insert(&mut self, parse: &mut Parse) {
         let (_new, name) = { self.global.write().insert(parse) };
-        let existed = self.local.insert(parse.name().to_owned(), name.clone());
-        self.memory_used = self.memory_usage();
+        let key = parse.name();
+        let existed = self.local.insert(key.to_owned(), name.clone());
 
         // Client prepared it again because it got an error the first time.
         // We can check if this is a new statement first, but this is an error
         // condition which happens very infrequently, so we optimize for the happy path.
-        if existed.is_some() {
-            {
-                self.global.write().decrement(&name);
-            }
+        if let Some(old_value) = existed {
+            // Key already existed, only value changed.
+            self.memory_used = self.memory_used.saturating_sub(str_mem(&old_value));
+            self.memory_used += str_mem(&name);
+            self.global.write().decrement(&old_value);
+        } else {
+            // New entry.
+            self.memory_used += str_mem(key) + str_mem(&name);
         }
 
         parse.rename_fast(&name)
@@ -90,8 +90,18 @@ impl PreparedStatements {
     /// Insert statement into the cache bypassing duplicate checks.
     pub fn insert_anyway(&mut self, parse: &mut Parse) {
         let name = { self.global.write().insert_anyway(parse) };
-        self.local.insert(parse.name().to_owned(), name.clone());
-        self.memory_used = self.memory_usage();
+        let key = parse.name();
+        let existed = self.local.insert(key.to_owned(), name.clone());
+
+        if let Some(old_value) = existed {
+            // Key already existed, only value changed.
+            self.memory_used = self.memory_used.saturating_sub(str_mem(&old_value));
+            self.memory_used += str_mem(&name);
+        } else {
+            // New entry.
+            self.memory_used += str_mem(key) + str_mem(&name);
+        }
+
         parse.rename_fast(&name)
     }
 
@@ -112,6 +122,12 @@ impl PreparedStatements {
         self.local.len()
     }
 
+    /// Current prepared statements compatibility level.
+    #[cfg(test)]
+    pub fn level(&self) -> PreparedStatementsLevel {
+        self.level
+    }
+
     /// Is the local cache empty?
     pub fn is_empty(&self) -> bool {
         self.len_local() == 0
@@ -120,10 +136,10 @@ impl PreparedStatements {
     /// Remove prepared statement from local cache.
     pub fn close(&mut self, name: &str) {
         if let Some(global_name) = self.local.remove(name) {
-            {
-                self.global.write().close(&global_name);
-            }
-            self.memory_used = self.memory_usage();
+            self.global.write().close(&global_name);
+            self.memory_used = self
+                .memory_used
+                .saturating_sub(str_mem(name) + str_mem(&global_name));
         }
     }
 
@@ -138,7 +154,7 @@ impl PreparedStatements {
         }
 
         self.local.clear();
-        self.memory_used = self.memory_usage();
+        self.memory_used = 0;
     }
 
     /// How much memory is used, approx.
@@ -147,7 +163,6 @@ impl PreparedStatements {
     }
 
     /// Set the prepared statements level.
-    #[cfg(test)]
     pub fn set_level(&mut self, level: PreparedStatementsLevel) {
         self.level = level;
     }
@@ -257,5 +272,58 @@ mod test {
                 .used,
             0
         );
+    }
+
+    /// Regression test: anonymous statements with different query texts
+    /// must decrement the OLD global entry, not the new one.
+    /// Previously, the new entry was immediately set to used=0 (evictable)
+    /// while the old entry leaked at used=1 forever.
+    #[test]
+    fn test_anonymous_different_queries_decrement_old() {
+        let mut statements = PreparedStatements::default();
+
+        // First anonymous Parse: "" → __pgdog_1, used: 1
+        let mut parse1 = ProtocolMessage::from(Parse::new_anonymous("SELECT 1"));
+        statements.maybe_rewrite(&mut parse1).unwrap();
+
+        let global = statements.global.read();
+        let first = global.statements().values().next().unwrap();
+        assert_eq!(first.used, 1);
+        let first_name = first.name();
+        drop(global);
+
+        // Second anonymous Parse with DIFFERENT query: "" → __pgdog_2
+        // This replaces the local "" mapping.
+        let mut parse2 = ProtocolMessage::from(Parse::new_anonymous("SELECT 2"));
+        statements.maybe_rewrite(&mut parse2).unwrap();
+
+        let global = statements.global.read();
+        assert_eq!(global.statements().len(), 2);
+
+        for (_, stmt) in global.statements() {
+            if stmt.name() == first_name {
+                // Old entry: should be decremented to 0 (no longer referenced).
+                assert_eq!(stmt.used, 0, "old entry should be decremented");
+            } else {
+                // New entry: should stay at 1 (actively referenced).
+                assert_eq!(stmt.used, 1, "new entry should remain at used=1");
+            }
+        }
+        drop(global);
+
+        // Third anonymous Parse with yet another query.
+        let mut parse3 = ProtocolMessage::from(Parse::new_anonymous("SELECT 3"));
+        statements.maybe_rewrite(&mut parse3).unwrap();
+
+        let global = statements.global.read();
+        assert_eq!(global.statements().len(), 3);
+
+        // Exactly one entry should have used=1 (the latest).
+        let active = global.statements().values().filter(|s| s.used == 1).count();
+        assert_eq!(active, 1, "exactly one statement should be active");
+
+        // The other two should have used=0.
+        let unused = global.statements().values().filter(|s| s.used == 0).count();
+        assert_eq!(unused, 2, "old statements should be unused");
     }
 }

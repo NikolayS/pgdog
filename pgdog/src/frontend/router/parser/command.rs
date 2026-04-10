@@ -5,6 +5,14 @@ use crate::{
 };
 use lazy_static::lazy_static;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetParam {
+    pub name: String,
+    pub value: ParameterValue,
+    pub local: bool,
+    pub reset: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Query(Route),
@@ -13,6 +21,7 @@ pub enum Command {
         query: BufferedQuery,
         transaction_type: TransactionType,
         extended: bool,
+        route: Route,
     },
     CommitTransaction {
         extended: bool,
@@ -22,11 +31,10 @@ pub enum Command {
     },
     ReplicationMeta,
     Set {
-        name: String,
-        value: ParameterValue,
-        local: bool,
+        params: Vec<SetParam>,
         route: Route,
     },
+    ResetAll,
     PreparedStatement(Prepare),
     InternalField {
         name: String,
@@ -59,6 +67,7 @@ impl Command {
         match self {
             Self::Query(route) => route,
             Self::Set { route, .. } => route,
+            Self::StartTransaction { route, .. } => route,
             _ => &DEFAULT_ROUTE,
         }
     }

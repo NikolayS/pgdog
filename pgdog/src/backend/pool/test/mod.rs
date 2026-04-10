@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rand::Rng;
 use tokio::spawn;
@@ -18,9 +18,11 @@ use super::*;
 
 pub fn pool() -> Pool {
     let config = Config {
-        max: 1,
-        min: 1,
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 1,
+            min: 1,
+            ..Config::default().inner
+        },
     };
 
     let pool = Pool::new(&PoolConfig {
@@ -29,7 +31,7 @@ pub fn pool() -> Pool {
             port: 5432,
             database_name: "pgdog".into(),
             user: "pgdog".into(),
-            password: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
             ..Default::default()
         },
         config,
@@ -40,10 +42,12 @@ pub fn pool() -> Pool {
 
 pub fn pool_with_prepared_capacity(capacity: usize) -> Pool {
     let config = Config {
-        max: 1,
-        min: 1,
-        prepared_statements_limit: capacity,
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 1,
+            min: 1,
+            prepared_statements_limit: capacity,
+            ..Config::default().inner
+        },
     };
 
     let pool = Pool::new(&PoolConfig {
@@ -52,7 +56,7 @@ pub fn pool_with_prepared_capacity(capacity: usize) -> Pool {
             port: 5432,
             database_name: "pgdog".into(),
             user: "pgdog".into(),
-            password: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
             ..Default::default()
         },
         config,
@@ -122,8 +126,10 @@ async fn test_concurrency_with_gas() {
     let tracker = TaskTracker::new();
 
     let config = Config {
-        max: 10,
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 10,
+            ..Config::default().inner
+        },
     };
     pool.update_config(config);
 
@@ -162,9 +168,11 @@ async fn test_pause() {
     let pool = pool();
     let tracker = TaskTracker::new();
     let config = Config {
-        checkout_timeout: Duration::from_millis(1_000),
-        max: 1,
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            checkout_timeout: Duration::from_millis(1_000),
+            max: 1,
+            ..Config::default().inner
+        },
     };
     pool.update_config(config);
 
@@ -255,7 +263,7 @@ async fn test_benchmark_pool() {
         handle.await.unwrap();
     }
     let duration = start.elapsed();
-    println!("bench: {}ms", duration.as_millis());
+    eprintln!("bench: {}ms", duration.as_millis());
 }
 
 #[tokio::test]
@@ -306,9 +314,11 @@ async fn test_server_force_close_discards_connection() {
     crate::logger();
 
     let config = Config {
-        max: 1,
-        min: 0,
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 1,
+            min: 0,
+            ..Config::default().inner
+        },
     };
 
     let pool = Pool::new(&PoolConfig {
@@ -317,7 +327,7 @@ async fn test_server_force_close_discards_connection() {
             port: 5432,
             database_name: "pgdog".into(),
             user: "pgdog".into(),
-            password: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
             ..Default::default()
         },
         config,
@@ -398,7 +408,7 @@ async fn test_prepared_statements_limit() {
         guard
             .send(
                 &vec![
-                    Parse::named(&format!("__pgdog_{}", id), "SELECT $1::bigint").into(),
+                    Parse::named(format!("__pgdog_{}", id), "SELECT $1::bigint").into(),
                     Sync.into(),
                 ]
                 .into(),
@@ -430,7 +440,7 @@ async fn test_prepared_statements_limit() {
             || guard.prepared_statements_mut().contains("__pgdog_98")
     );
     assert_eq!(guard.prepared_statements_mut().len(), 2);
-    assert_eq!(guard.stats().total.prepared_statements, 2); // stats are accurate.
+    assert_eq!(guard.stats().total().prepared_statements, 2); // stats are accurate.
 
     let pool = pool_with_prepared_capacity(100);
 
@@ -440,7 +450,7 @@ async fn test_prepared_statements_limit() {
         guard
             .send(
                 &vec![
-                    Parse::named(&format!("__pgdog_{}", id), "SELECT $1::bigint").into(),
+                    Parse::named(format!("__pgdog_{}", id), "SELECT $1::bigint").into(),
                     Sync.into(),
                 ]
                 .into(),
@@ -458,14 +468,14 @@ async fn test_prepared_statements_limit() {
     let mut guard = pool.get(&Request::default()).await.unwrap();
     assert!(guard.prepared_statements_mut().contains("__pgdog_99"));
     assert_eq!(guard.prepared_statements_mut().len(), 100);
-    assert_eq!(guard.stats().total.prepared_statements, 100); // stats are accurate.
+    assert_eq!(guard.stats().total().prepared_statements, 100); // stats are accurate.
 
     // Let's make sure Postgres agreees.
     guard.sync_prepared_statements().await.unwrap();
 
     assert!(guard.prepared_statements_mut().contains("__pgdog_99"));
     assert_eq!(guard.prepared_statements_mut().len(), 100);
-    assert_eq!(guard.stats().total.prepared_statements, 100); // stats are accurate.
+    assert_eq!(guard.stats().total().prepared_statements, 100); // stats are accurate.
 }
 
 #[tokio::test]
@@ -473,11 +483,13 @@ async fn test_idle_healthcheck_loop() {
     crate::logger();
 
     let config = Config {
-        max: 1,
-        min: 1,
-        idle_healthcheck_interval: Duration::from_millis(100),
-        idle_healthcheck_delay: Duration::from_millis(10),
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 1,
+            min: 1,
+            idle_healthcheck_interval: Duration::from_millis(100),
+            idle_healthcheck_delay: Duration::from_millis(10),
+            ..Config::default().inner
+        },
     };
 
     let pool = Pool::new(&PoolConfig {
@@ -486,7 +498,7 @@ async fn test_idle_healthcheck_loop() {
             port: 5432,
             database_name: "pgdog".into(),
             user: "pgdog".into(),
-            password: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
             ..Default::default()
         },
         config,
@@ -518,10 +530,12 @@ async fn test_checkout_timeout() {
     crate::logger();
 
     let config = Config {
-        max: 1,
-        min: 1,
-        checkout_timeout: Duration::from_millis(100),
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 1,
+            min: 1,
+            checkout_timeout: Duration::from_millis(100),
+            ..Config::default().inner
+        },
     };
 
     let pool = Pool::new(&PoolConfig {
@@ -545,9 +559,11 @@ async fn test_move_conns_to() {
     crate::logger();
 
     let config = Config {
-        max: 3,
-        min: 0,
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 3,
+            min: 0,
+            ..Config::default().inner
+        },
     };
 
     let source = Pool::new(&PoolConfig {
@@ -556,7 +572,7 @@ async fn test_move_conns_to() {
             port: 5432,
             database_name: "pgdog".into(),
             user: "pgdog".into(),
-            password: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
             ..Default::default()
         },
         config,
@@ -569,7 +585,7 @@ async fn test_move_conns_to() {
             port: 5432,
             database_name: "pgdog".into(),
             user: "pgdog".into(),
-            password: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
             ..Default::default()
         },
         config,
@@ -591,12 +607,12 @@ async fn test_move_conns_to() {
     source.move_conns_to(&destination).unwrap();
 
     assert!(!source.lock().online);
-    assert!(destination.lock().online);
+    assert!(!destination.lock().online);
     assert_eq!(destination.lock().total(), 2);
     assert_eq!(source.lock().total(), 0);
     let new_pool_id = destination.id();
     for conn in destination.lock().idle_conns() {
-        assert_eq!(conn.stats().pool_id, new_pool_id);
+        assert_eq!(conn.stats().pool_id(), new_pool_id);
     }
 
     drop(conn2);
@@ -608,16 +624,164 @@ async fn test_move_conns_to() {
 }
 
 #[tokio::test]
+async fn test_move_conns_all_idle() {
+    crate::logger();
+
+    let config = Config {
+        inner: pgdog_stats::Config {
+            max: 3,
+            min: 0,
+            ..Config::default().inner
+        },
+    };
+
+    let source = Pool::new(&PoolConfig {
+        address: Address::new_test(),
+        config,
+    });
+    source.launch();
+
+    let destination = Pool::new(&PoolConfig {
+        address: Address::new_test(),
+        config,
+    });
+
+    // Check out and return 3 connections so they become idle.
+    let c1 = source.get(&Request::default()).await.unwrap();
+    let c2 = source.get(&Request::default()).await.unwrap();
+    let c3 = source.get(&Request::default()).await.unwrap();
+    drop(c1);
+    drop(c2);
+    drop(c3);
+    sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(source.lock().idle(), 3);
+
+    source.move_conns_to(&destination).unwrap();
+
+    // All idle connections moved to destination.
+    assert_eq!(source.lock().total(), 0);
+    assert_eq!(destination.lock().idle(), 3);
+    assert_eq!(destination.lock().checked_out(), 0);
+
+    let new_pool_id = destination.id();
+    for conn in destination.lock().idle_conns() {
+        assert_eq!(conn.stats().pool_id(), new_pool_id);
+    }
+}
+
+#[tokio::test]
+async fn test_move_conns_all_checked_out() {
+    crate::logger();
+
+    let config = Config {
+        inner: pgdog_stats::Config {
+            max: 3,
+            min: 0,
+            ..Config::default().inner
+        },
+    };
+
+    let source = Pool::new(&PoolConfig {
+        address: Address::new_test(),
+        config,
+    });
+    source.launch();
+
+    let destination = Pool::new(&PoolConfig {
+        address: Address::new_test(),
+        config,
+    });
+
+    let c1 = source.get(&Request::default()).await.unwrap();
+    let c2 = source.get(&Request::default()).await.unwrap();
+    let c3 = source.get(&Request::default()).await.unwrap();
+
+    assert_eq!(source.lock().checked_out(), 3);
+    assert_eq!(source.lock().idle(), 0);
+
+    source.move_conns_to(&destination).unwrap();
+
+    // All connections are in-flight, tracked as taken in destination.
+    assert_eq!(source.lock().total(), 0);
+    assert_eq!(destination.lock().total(), 3);
+    assert_eq!(destination.lock().checked_out(), 3);
+    assert_eq!(destination.lock().idle(), 0);
+
+    // Return them one by one.
+    drop(c1);
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(destination.lock().idle(), 1);
+    assert_eq!(destination.lock().checked_out(), 2);
+
+    drop(c2);
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(destination.lock().idle(), 2);
+    assert_eq!(destination.lock().checked_out(), 1);
+
+    drop(c3);
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(destination.lock().idle(), 3);
+    assert_eq!(destination.lock().checked_out(), 0);
+}
+
+#[tokio::test]
+async fn test_move_conns_destination_serves_after_launch() {
+    crate::logger();
+
+    let config = Config {
+        inner: pgdog_stats::Config {
+            max: 3,
+            min: 0,
+            ..Config::default().inner
+        },
+    };
+
+    let source = Pool::new(&PoolConfig {
+        address: Address::new_test(),
+        config,
+    });
+    source.launch();
+
+    let destination = Pool::new(&PoolConfig {
+        address: Address::new_test(),
+        config,
+    });
+
+    // Create one idle connection.
+    let c1 = source.get(&Request::default()).await.unwrap();
+    drop(c1);
+    sleep(Duration::from_millis(50)).await;
+
+    source.move_conns_to(&destination).unwrap();
+    assert_eq!(destination.lock().idle(), 1);
+    assert!(!destination.lock().online);
+
+    // Launch destination, connections should be servable.
+    destination.launch();
+    assert!(destination.lock().online);
+
+    let c = destination.get(&Request::default()).await.unwrap();
+    assert_eq!(destination.lock().checked_out(), 1);
+    assert_eq!(destination.lock().idle(), 0);
+    drop(c);
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(destination.lock().idle(), 1);
+}
+
+#[tokio::test]
 async fn test_lsn_monitor() {
     crate::logger();
 
     let config = Config {
-        max: 1,
-        min: 1,
-        lsn_check_delay: Duration::from_millis(10),
-        lsn_check_interval: Duration::from_millis(50),
-        lsn_check_timeout: Duration::from_millis(5_000),
-        ..Default::default()
+        inner: pgdog_stats::Config {
+            max: 1,
+            min: 1,
+            lsn_check_delay: Duration::from_millis(10),
+            lsn_check_interval: Duration::from_millis(50),
+            lsn_check_timeout: Duration::from_millis(5_000),
+            ..Config::default().inner
+        },
     };
 
     let pool = Pool::new(&PoolConfig {
@@ -644,7 +808,7 @@ async fn test_lsn_monitor() {
         "Offset bytes should be greater than 0"
     );
 
-    let age = stats.lsn_age(Instant::now());
+    let age = stats.lsn_age(SystemTime::now());
     assert!(
         age < Duration::from_millis(300),
         "LSN stats age should be recent, got {:?}",

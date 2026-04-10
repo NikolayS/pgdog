@@ -3,7 +3,6 @@
 use std::cmp::max;
 use std::collections::VecDeque;
 use std::fmt::Display;
-use std::time::Duration;
 
 use crate::backend::{stats::Counts as BackendCounts, Server};
 use crate::backend::{ConnectReason, DisconnectReason};
@@ -11,7 +10,9 @@ use crate::net::messages::BackendKeyData;
 
 use tokio::time::Instant;
 
-use super::{Config, Error, Mapping, Oids, Pool, Request, Stats, Taken, Waiter};
+use super::{
+    lsn_monitor::ReplicaLag, Config, Error, Mapping, Oids, Pool, Request, Stats, Taken, Waiter,
+};
 
 /// Pool internals protected by a mutex.
 #[derive(Default)]
@@ -48,7 +49,7 @@ pub(super) struct Inner {
     /// Unique pool identifier.
     id: u64,
     /// Replica lag.
-    pub(super) replica_lag: Duration,
+    pub(super) replica_lag: ReplicaLag,
 }
 
 impl std::fmt::Debug for Inner {
@@ -81,7 +82,7 @@ impl Inner {
             oids: None,
             moved: None,
             id,
-            replica_lag: Duration::ZERO,
+            replica_lag: ReplicaLag::default(),
         }
     }
     /// Total number of connections managed by the pool.
@@ -113,6 +114,11 @@ impl Inner {
     #[inline]
     pub(super) fn checked_out(&self) -> usize {
         self.taken.len()
+    }
+
+    /// Get backend IDs for all currently checked out servers.
+    pub(super) fn checked_out_server_ids(&self) -> Vec<BackendKeyData> {
+        self.taken.servers()
     }
 
     /// Find the server currently linked to this client, if any.
@@ -293,7 +299,7 @@ impl Inner {
         let taken = std::mem::take(&mut self.taken);
 
         for conn in idle.iter_mut() {
-            conn.stats_mut().pool_id = destination.id();
+            conn.stats_mut().set_pool_id(destination.id());
         }
 
         (idle, taken)
@@ -309,6 +315,7 @@ impl Inner {
         mut server: Box<Server>,
         now: Instant,
         stats: BackendCounts,
+        moving: bool,
     ) -> Result<CheckInResult, Error> {
         let mut result = CheckInResult {
             server_error: false,
@@ -319,9 +326,9 @@ impl Inner {
             result.replenish = false;
             // Prevents deadlocks.
             if moved.id() != self.id {
-                server.stats_mut().pool_id = moved.id();
-                server.stats_mut().update();
-                moved.lock().maybe_check_in(server, now, stats)?;
+                server.stats_mut().set_pool_id(moved.id());
+                server.stats().update();
+                moved.lock().maybe_check_in(server, now, stats, true)?;
                 return Ok(result);
             }
         }
@@ -341,7 +348,7 @@ impl Inner {
         }
 
         // Pool is offline or paused, connection should be closed.
-        if !self.online || self.paused {
+        if !self.online && !moving || self.paused {
             result.replenish = false;
             return Ok(result);
         }
@@ -499,7 +506,7 @@ mod test {
             .unwrap();
 
         let result = inner
-            .maybe_check_in(server, Instant::now(), BackendCounts::default())
+            .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
             .unwrap();
 
         assert!(!result.server_error);
@@ -509,9 +516,11 @@ mod test {
 
     #[test]
     fn test_paused_pool_behavior() {
-        let mut inner = Inner::default();
-        inner.online = true;
-        inner.paused = true;
+        let mut inner = Inner {
+            online: true,
+            paused: true,
+            ..Default::default()
+        };
 
         let server = Box::new(Server::default());
         let server_id = *server.id();
@@ -524,7 +533,7 @@ mod test {
             .unwrap();
 
         inner
-            .maybe_check_in(server, Instant::now(), BackendCounts::default())
+            .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
             .unwrap();
 
         assert_eq!(inner.total(), 0); // pool paused, connection not added
@@ -532,9 +541,11 @@ mod test {
 
     #[test]
     fn test_online_pool_accepts_connections() {
-        let mut inner = Inner::default();
-        inner.online = true;
-        inner.paused = false;
+        let mut inner = Inner {
+            online: true,
+            paused: false,
+            ..Default::default()
+        };
 
         let server = Box::new(Server::default());
         let server_id = *server.id();
@@ -547,7 +558,7 @@ mod test {
             .unwrap();
 
         let result = inner
-            .maybe_check_in(server, Instant::now(), BackendCounts::default())
+            .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
             .unwrap();
 
         assert!(!result.server_error);
@@ -557,8 +568,10 @@ mod test {
 
     #[test]
     fn test_server_error_handling() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
 
         let server = Box::new(Server::new_error());
         let server_id = *server.id();
@@ -574,7 +587,7 @@ mod test {
         assert_eq!(inner.checked_out(), 1);
 
         let result = inner
-            .maybe_check_in(server, Instant::now(), BackendCounts::default())
+            .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
             .unwrap();
         assert!(result.server_error);
 
@@ -584,8 +597,10 @@ mod test {
 
     #[test]
     fn test_should_create_with_waiting_clients() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
         inner.config.max = 5;
         inner.config.min = 1;
 
@@ -610,8 +625,10 @@ mod test {
 
     #[test]
     fn test_should_create_below_minimum() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
         inner.config.min = 2;
         inner.config.max = 5;
 
@@ -632,8 +649,10 @@ mod test {
 
     #[test]
     fn test_should_not_create_at_max() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
         inner.config.max = 3;
 
         assert!(!inner.full());
@@ -686,8 +705,10 @@ mod test {
 
     #[test]
     fn test_close_old_ignores_minimum() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
         inner.config.min = 1;
         inner.config.max_age = Duration::from_millis(60_000);
 
@@ -703,7 +724,7 @@ mod test {
             .unwrap();
 
         inner
-            .maybe_check_in(server, Instant::now(), BackendCounts::default())
+            .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
             .unwrap();
         assert_eq!(inner.idle(), 1);
 
@@ -735,8 +756,10 @@ mod test {
 
     #[test]
     fn test_max_age_enforcement_on_checkin() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
         inner.config.max_age = Duration::from_millis(60_000);
 
         let server = Box::new(Server::default());
@@ -754,6 +777,7 @@ mod test {
                 server,
                 Instant::now() + Duration::from_secs(61), // Exceeds max age
                 BackendCounts::default(),
+                false,
             )
             .unwrap();
 
@@ -937,8 +961,10 @@ mod test {
 
     #[test]
     fn test_should_create_for_waiting_clients_even_above_minimum() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
         inner.config.min = 1;
         inner.config.max = 5;
 
@@ -983,8 +1009,10 @@ mod test {
 
     #[test]
     fn test_should_not_create_offline() {
-        let mut inner = Inner::default();
-        inner.online = false;
+        let mut inner = Inner {
+            online: false,
+            ..Default::default()
+        };
         inner.config.min = 2;
 
         assert!(inner.total() < inner.min());
@@ -1088,8 +1116,10 @@ mod test {
 
     #[test]
     fn test_same_client_checks_out_two_connections() {
-        let mut inner = Inner::default();
-        inner.online = true;
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
         inner.config.max = 2;
         inner.config.min = 0;
 
@@ -1107,7 +1137,7 @@ mod test {
 
         // Same client ID for both requests
         let client_id = BackendKeyData::new();
-        let request = Request::new(client_id);
+        let request = Request::unrouted(client_id);
 
         // Check out first connection
         let conn1 = inner
@@ -1133,14 +1163,14 @@ mod test {
         // Check in both connections
         let now = Instant::now();
         inner
-            .maybe_check_in(conn1, now, BackendCounts::default())
+            .maybe_check_in(conn1, now, BackendCounts::default(), false)
             .unwrap();
         assert_eq!(inner.idle(), 1);
         assert_eq!(inner.checked_out(), 1);
         assert_eq!(inner.total(), 2);
 
         inner
-            .maybe_check_in(conn2, now, BackendCounts::default())
+            .maybe_check_in(conn2, now, BackendCounts::default(), false)
             .unwrap();
         assert_eq!(inner.idle(), 2);
         assert_eq!(inner.checked_out(), 0);

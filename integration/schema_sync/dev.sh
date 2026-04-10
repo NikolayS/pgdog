@@ -1,8 +1,13 @@
 #!/bin/bash
 set -e
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PGDOG_BIN_PATH="${PGDOG_BIN:-${SCRIPT_DIR}/../../target/release/pgdog}"
+PGDOG_BIN_PATH="${PGDOG_BIN:-${SCRIPT_DIR}/../../target/debug/pgdog}"
 pushd ${SCRIPT_DIR}
+
+dropdb pgdog1 || true
+dropdb pgdog2 || true
+createdb pgdog1
+createdb pgdog2
 
 export PGPASSWORD=pgdog
 export PGUSER=pgdog
@@ -42,11 +47,70 @@ pg_dump \
     --no-publications pgdog2 > destination.sql
 
 for f in source.sql destination.sql; do
-    sed -i '/^\\restrict.*$/d' $f
-    sed -i '/^\\unrestrict.*$/d' $f
+    sed -i.bak '/^\\restrict.*$/d' $f
+    sed -i.bak '/^\\unrestrict.*$/d' $f
 done
 
-diff source.sql destination.sql
-rm source.sql
-rm destination.sql
+# Expected integer -> bigint conversions (normalized to just column_name and type)
+# Format: column_name integer -> column_name bigint
+EXPECTED_CONVERSIONS=$(cat <<EOF
+audit_id integer
+audit_id bigint
+category_id integer
+category_id bigint
+document_id integer
+document_id bigint
+event_id integer
+event_id bigint
+flag_id integer
+flag_id bigint
+notification_id integer
+notification_id bigint
+override_id integer
+override_id bigint
+price_history_id integer
+price_history_id bigint
+session_id integer
+session_id bigint
+setting_id integer
+setting_id bigint
+ticket_id integer
+ticket_id bigint
+EOF
+)
+
+diff source.sql destination.sql > diff.txt || true
+
+# Extract integer -> bigint conversions from the diff
+# 1. Get removed (< integer) and added (> bigint) column lines
+# 2. Only keep columns that appear as integer in source AND bigint in destination
+REMOVED_INT=$(grep '^<' diff.txt | \
+    sed -E 's/.*[[:space:]]([a-z_]+)[[:space:]]+integer\b.*/\1/' | \
+    grep -E '^[a-z_]+$' | sort -u)
+
+ADDED_BIGINT=$(grep '^>' diff.txt | \
+    sed -E 's/.*[[:space:]]([a-z_]+)[[:space:]]+bigint\b.*/\1/' | \
+    grep -E '^[a-z_]+$' | sort -u)
+
+# Columns that changed from integer to bigint
+CONVERTED=$(comm -12 <(echo "$REMOVED_INT") <(echo "$ADDED_BIGINT"))
+
+# Build the expected format: column_name integer \n column_name bigint
+ACTUAL_CONVERSIONS=$(echo "$CONVERTED" | while read col; do
+    echo "$col integer"
+    echo "$col bigint"
+done | sort -u)
+
+EXPECTED_SORTED=$(echo "$EXPECTED_CONVERSIONS" | sort -u)
+
+if [ "$ACTUAL_CONVERSIONS" != "$EXPECTED_SORTED" ]; then
+    echo "Schema diff does not match expected integer -> bigint conversions"
+    echo "=== Expected ==="
+    echo "$EXPECTED_SORTED"
+    echo "=== Actual ==="
+    echo "$ACTUAL_CONVERSIONS"
+    exit 1
+fi
+
+rm source.sql destination.sql diff.txt
 popd

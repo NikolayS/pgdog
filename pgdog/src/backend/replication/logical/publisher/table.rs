@@ -3,20 +3,28 @@
 use std::time::Duration;
 
 use pgdog_config::QueryParserEngine;
+use tokio::select;
+use tracing::error;
 
 use crate::backend::pool::Address;
 use crate::backend::replication::publisher::progress::Progress;
 use crate::backend::replication::publisher::Lsn;
 
-use crate::backend::{Cluster, Server};
+use crate::backend::replication::status::TableCopy;
+use crate::backend::{Cluster, Server, ShardedTables};
+use crate::config::config;
+use crate::frontend::router::parser::Column;
 use crate::net::replication::StatusUpdate;
+use crate::util::escape_identifier;
 
 use super::super::{subscriber::CopySubscriber, Error};
-use super::{Copy, PublicationTable, PublicationTableColumn, ReplicaIdentity, ReplicationSlot};
+use super::{
+    AbortSignal, Copy, PublicationTable, PublicationTableColumn, ReplicaIdentity, ReplicationSlot,
+};
 
 use tracing::info;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Table {
     /// Name of the table publication.
     pub publication: String,
@@ -58,6 +66,11 @@ impl Table {
         Ok(results)
     }
 
+    /// Key used for duplicate check.
+    pub(super) fn key(&self) -> (String, String) {
+        (self.table.schema.clone(), self.table.name.clone())
+    }
+
     /// Check that the table supports replication.
     pub fn valid(&self) -> Result<(), Error> {
         if !self.columns.iter().any(|c| c.identity) {
@@ -73,7 +86,7 @@ impl Table {
             "({})",
             self.columns
                 .iter()
-                .map(|c| format!("\"{}\"", c.name.as_str()))
+                .map(|c| format!("\"{}\"", escape_identifier(&c.name)))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -92,14 +105,14 @@ impl Table {
                 self.columns
                     .iter()
                     .filter(|c| c.identity)
-                    .map(|c| format!("\"{}\"", c.name.as_str()))
+                    .map(|c| format!("\"{}\"", escape_identifier(&c.name)))
                     .collect::<Vec<_>>()
                     .join(", "),
                 self.columns
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| !c.identity)
-                    .map(|(i, c)| format!("\"{}\" = ${}", c.name, i + 1))
+                    .map(|(i, c)| format!("\"{}\" = ${}", escape_identifier(&c.name), i + 1))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -109,8 +122,8 @@ impl Table {
 
         format!(
             "INSERT INTO \"{}\".\"{}\" {} {} {}",
-            self.table.destination_schema(),
-            self.table.destination_name(),
+            escape_identifier(self.table.destination_schema()),
+            escape_identifier(self.table.destination_name()),
             names,
             values,
             on_conflict
@@ -124,7 +137,7 @@ impl Table {
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.identity)
-            .map(|(i, c)| format!("\"{}\" = ${}", c.name, i + 1))
+            .map(|(i, c)| format!("\"{}\" = ${}", escape_identifier(&c.name), i + 1))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -133,14 +146,14 @@ impl Table {
             .iter()
             .enumerate()
             .filter(|(_, c)| c.identity)
-            .map(|(i, c)| format!("\"{}\" = ${}", c.name, i + 1))
+            .map(|(i, c)| format!("\"{}\" = ${}", escape_identifier(&c.name), i + 1))
             .collect::<Vec<_>>()
             .join(" AND ");
 
         format!(
             "UPDATE \"{}\".\"{}\" SET {} WHERE {}",
-            self.table.destination_schema(),
-            self.table.destination_name(),
+            escape_identifier(self.table.destination_schema()),
+            escape_identifier(self.table.destination_name()),
             set_clause,
             where_clause
         )
@@ -151,16 +164,16 @@ impl Table {
         let where_clause = self
             .columns
             .iter()
+            .filter(|c| c.identity)
             .enumerate()
-            .filter(|(_, c)| c.identity)
-            .map(|(i, c)| format!("\"{}\" = ${}", c.name, i + 1))
+            .map(|(i, c)| format!("\"{}\" = ${}", escape_identifier(&c.name), i + 1))
             .collect::<Vec<_>>()
             .join(" AND ");
 
         format!(
             "DELETE FROM \"{}\".\"{}\" WHERE {}",
-            self.table.destination_schema(),
-            self.table.destination_name(),
+            escape_identifier(self.table.destination_schema()),
+            escape_identifier(self.table.destination_name()),
             where_clause
         )
     }
@@ -177,7 +190,30 @@ impl Table {
         Ok(())
     }
 
-    pub async fn data_sync(&mut self, source: &Address, dest: &Cluster) -> Result<Lsn, Error> {
+    /// Check if this table is sharded.
+    pub fn is_sharded(&self, tables: &ShardedTables) -> bool {
+        for column in &self.columns {
+            let c = Column {
+                name: &column.name,
+                table: Some(&self.table.name),
+                schema: Some(&self.table.schema),
+            };
+
+            if tables.get_table(c).is_some() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub async fn data_sync(
+        &mut self,
+        source: &Address,
+        dest: &Cluster,
+        abort: AbortSignal,
+        tracker: &TableCopy,
+    ) -> Result<Lsn, Error> {
         info!(
             "data sync for \"{}\".\"{}\" started [{}]",
             self.table.schema, self.table.name, source
@@ -186,7 +222,9 @@ impl Table {
         // Sync data using COPY.
         // Publisher uses COPY [...] TO STDOUT.
         // Subscriber uses COPY [...] FROM STDIN.
-        let copy = Copy::new(self);
+        let copy = Copy::new(self, config().config.general.resharding_copy_format);
+
+        tracker.update_sql(&copy.statement().copy_out());
 
         // Create new standalone connection for the copy.
         // let mut server = Server::connect(source, ServerOptions::new_replication()).await?;
@@ -207,11 +245,23 @@ impl Table {
         let progress = Progress::new_data_sync(&self.table);
 
         while let Some(data_row) = copy.data(slot.server()?).await? {
-            copy_sub.copy_data(data_row).await?;
-            progress.update(copy_sub.bytes_sharded(), slot.lsn().lsn);
+            select! {
+                _ = abort.aborted() =>  {
+                    error!("aborting data sync for table {}", self.table);
+
+                    return Err(Error::CopyAborted(self.table.clone()))
+                },
+
+                result = copy_sub.copy_data(data_row) => {
+                    let (rows, bytes) = result?;
+                    progress.update(copy_sub.bytes_sharded(), slot.lsn().lsn);
+                    tracker.update_progress(bytes, rows);
+                }
+            }
         }
 
         copy_sub.copy_done().await?;
+
         copy_sub.disconnect().await?;
         progress.done();
 
@@ -244,6 +294,143 @@ mod test {
     use crate::config::config;
 
     use super::*;
+
+    fn make_table(columns: Vec<(&str, bool)>) -> Table {
+        Table {
+            publication: "test".to_string(),
+            table: PublicationTable {
+                schema: "public".to_string(),
+                name: "test_table".to_string(),
+                attributes: "".to_string(),
+                parent_schema: "".to_string(),
+                parent_name: "".to_string(),
+            },
+            identity: ReplicaIdentity {
+                oid: pgdog_postgres_types::Oid(1),
+                identity: "".to_string(),
+                kind: "".to_string(),
+            },
+            columns: columns
+                .into_iter()
+                .map(|(name, identity)| PublicationTableColumn {
+                    oid: 1,
+                    name: name.to_string(),
+                    type_oid: pgdog_postgres_types::Oid(23),
+                    identity,
+                })
+                .collect(),
+            lsn: Lsn::default(),
+            query_parser_engine: QueryParserEngine::default(),
+        }
+    }
+
+    #[test]
+    fn test_sql_generation_simple() {
+        let table = make_table(vec![("id", true), ("name", false), ("value", false)]);
+
+        let insert = table.insert(false);
+        assert!(pg_query::parse(&insert).is_ok(), "insert: {}", insert);
+
+        let upsert = table.insert(true);
+        assert!(pg_query::parse(&upsert).is_ok(), "upsert: {}", upsert);
+
+        let update = table.update();
+        assert!(pg_query::parse(&update).is_ok(), "update: {}", update);
+
+        let delete = table.delete();
+        assert!(pg_query::parse(&delete).is_ok(), "delete: {}", delete);
+    }
+
+    #[test]
+    fn test_sql_generation_quoted_column() {
+        let table = make_table(vec![("id", true), ("has\"quote", false), ("normal", false)]);
+
+        let insert = table.insert(false);
+        assert!(pg_query::parse(&insert).is_ok(), "insert: {}", insert);
+
+        let upsert = table.insert(true);
+        assert!(pg_query::parse(&upsert).is_ok(), "upsert: {}", upsert);
+
+        let update = table.update();
+        assert!(pg_query::parse(&update).is_ok(), "update: {}", update);
+
+        let delete = table.delete();
+        assert!(pg_query::parse(&delete).is_ok(), "delete: {}", delete);
+    }
+
+    #[test]
+    fn test_delete_sequential_params_identity_not_first() {
+        // Regression: when identity columns aren't at the start of the column list,
+        // delete() must still produce sequential $1, $2, ... parameters.
+        let table = make_table(vec![("name", false), ("value", false), ("id", true)]);
+        let delete = table.delete();
+        assert!(delete.contains("$1"), "expected $1 in delete: {}", delete);
+        assert!(
+            !delete.contains("$3"),
+            "delete should not skip to $3: {}",
+            delete
+        );
+        assert!(pg_query::parse(&delete).is_ok(), "delete: {}", delete);
+    }
+
+    #[test]
+    fn test_delete_sequential_params_composite_key() {
+        // Regression: composite key with non-contiguous identity columns
+        // must produce $1, $2 not $1, $3.
+        let table = make_table(vec![("id", true), ("name", false), ("version", true)]);
+        let delete = table.delete();
+        assert!(
+            delete.contains("$1") && delete.contains("$2"),
+            "expected $1 and $2 in delete: {}",
+            delete
+        );
+        assert!(
+            !delete.contains("$3"),
+            "delete should not reference $3: {}",
+            delete
+        );
+        assert!(pg_query::parse(&delete).is_ok(), "delete: {}", delete);
+    }
+
+    #[test]
+    fn test_sql_generation_special_chars() {
+        let table = make_table(vec![
+            ("id", true),
+            ("col with spaces", false),
+            ("UPPER", false),
+        ]);
+
+        let insert = table.insert(false);
+        assert!(pg_query::parse(&insert).is_ok(), "insert: {}", insert);
+
+        let upsert = table.insert(true);
+        assert!(pg_query::parse(&upsert).is_ok(), "upsert: {}", upsert);
+
+        let update = table.update();
+        assert!(pg_query::parse(&update).is_ok(), "update: {}", update);
+
+        let delete = table.delete();
+        assert!(pg_query::parse(&delete).is_ok(), "delete: {}", delete);
+    }
+
+    #[test]
+    fn test_sql_generation_quoted_table_name() {
+        let mut table = make_table(vec![("id", true), ("value", false)]);
+        table.table.name = "table\"with\"quotes".to_string();
+        table.table.schema = "schema\"quote".to_string();
+
+        let insert = table.insert(false);
+        assert!(pg_query::parse(&insert).is_ok(), "insert: {}", insert);
+
+        let upsert = table.insert(true);
+        assert!(pg_query::parse(&upsert).is_ok(), "upsert: {}", upsert);
+
+        let update = table.update();
+        assert!(pg_query::parse(&update).is_ok(), "update: {}", update);
+
+        let delete = table.delete();
+        assert!(pg_query::parse(&delete).is_ok(), "delete: {}", delete);
+    }
 
     #[tokio::test]
     async fn test_publication() {

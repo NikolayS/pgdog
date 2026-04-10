@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
@@ -151,10 +152,11 @@ func TestShardedTwoPc(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
+	// +4 is for schema sync
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 200, "pgdog_2pc", "pgdog_sharded", 0, "primary")
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 200, "pgdog_2pc", "pgdog_sharded", 1, "primary")
-	assertShowField(t, "SHOW STATS", "total_xact_count", 401, "pgdog_2pc", "pgdog_sharded", 0, "primary") // PREPARE, COMMIT for each transaction + TRUNCATE
-	assertShowField(t, "SHOW STATS", "total_xact_count", 401, "pgdog_2pc", "pgdog_sharded", 1, "primary")
+	assertShowField(t, "SHOW STATS", "total_xact_count", 401+4, "pgdog_2pc", "pgdog_sharded", 0, "primary") // PREPARE, COMMIT for each transaction + TRUNCATE
+	assertShowField(t, "SHOW STATS", "total_xact_count", 401+4, "pgdog_2pc", "pgdog_sharded", 1, "primary")
 
 	for i := range 200 {
 		rows, err := conn.Query(
@@ -187,8 +189,7 @@ func TestShardedTwoPcAuto(t *testing.T) {
 		rows, err := conn.Query(context.Background(), "INSERT INTO sharded_omni (id, value) VALUES ($1, $2) RETURNING *", int64(i), fmt.Sprintf("value_%d", i))
 		assert.NoError(t, err)
 
-		// Returns 2 rows
-		assert.True(t, rows.Next())
+		// Returns 1 row
 		assert.True(t, rows.Next())
 		assert.False(t, rows.Next())
 	}
@@ -215,8 +216,7 @@ func TestShardedTwoPcAutoOff(t *testing.T) {
 		rows, err := conn.Query(context.Background(), "INSERT INTO sharded_omni (id, value) VALUES ($1, $2) RETURNING *", int64(i), fmt.Sprintf("value_%d", i))
 		assert.NoError(t, err)
 
-		// Returns 2 rows
-		assert.True(t, rows.Next())
+		// Returns 1 row
 		assert.True(t, rows.Next())
 		assert.False(t, rows.Next())
 	}
@@ -261,6 +261,9 @@ func TestShardedTwoPcAutoOnError(t *testing.T) {
 
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 0, "pgdog_2pc", "pgdog_sharded", 0, "primary")
 	assertShowField(t, "SHOW STATS", "total_xact_2pc_count", 0, "pgdog_2pc", "pgdog_sharded", 1, "primary")
+
+	// Give the pool an extra second to warm up.
+	time.Sleep(1 * time.Second)
 
 	// Attempt explicit transaction with non-existent table that would require 2PC
 	for i := range 25 {

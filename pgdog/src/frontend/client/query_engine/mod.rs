@@ -44,28 +44,6 @@ pub use two_pc::phase::TwoPcPhase;
 use two_pc::TwoPc;
 
 #[derive(Debug)]
-pub struct TestMode {
-    pub enabled: bool,
-}
-
-impl Default for TestMode {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TestMode {
-    pub fn new() -> Self {
-        Self {
-            #[cfg(test)]
-            enabled: true,
-            #[cfg(not(test))]
-            enabled: false,
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct QueryEngine {
     begin_stmt: Option<BufferedQuery>,
     router: Router,
@@ -73,7 +51,6 @@ pub struct QueryEngine {
     stats: Stats,
     backend: Connection,
     streaming: bool,
-    test_mode: TestMode,
     two_pc: TwoPc,
     notify_buffer: NotifyBuffer,
     pending_explain: Option<ExplainResponseState>,
@@ -82,22 +59,16 @@ pub struct QueryEngine {
 
 impl QueryEngine {
     /// Create new query engine.
-    pub fn new(
-        params: &Parameters,
-        comms: &ClientComms,
-        admin: bool,
-        passthrough_password: &Option<String>,
-    ) -> Result<Self, Error> {
+    pub fn new(params: &Parameters, comms: &ClientComms, admin: bool) -> Result<Self, Error> {
         let user = params.get_required("user")?;
         let database = params.get_default("database", user);
 
-        let backend = Connection::new(user, database, admin, passthrough_password)?;
+        let backend = Connection::new(user, database, admin)?;
 
         Ok(Self {
             backend,
             comms: comms.clone(),
             hooks: QueryEngineHooks::new(),
-            test_mode: TestMode::new(),
             stats: Stats::default(),
             streaming: bool::default(),
             two_pc: TwoPc::default(),
@@ -109,12 +80,7 @@ impl QueryEngine {
     }
 
     pub fn from_client(client: &Client) -> Result<Self, Error> {
-        Self::new(
-            &client.params,
-            &client.comms,
-            client.admin,
-            &client.passthrough_password,
-        )
+        Self::new(&client.params, &client.comms, client.admin)
     }
 
     /// Wait for an async message from the backend.
@@ -122,9 +88,9 @@ impl QueryEngine {
         Ok(self.backend.read().await?)
     }
 
-    /// Query engine finished executing.
-    pub fn done(&self) -> bool {
-        !self.backend.connected() && self.begin_stmt.is_none()
+    /// Client can safely disconnect (no active backend connection or pending transaction).
+    pub fn can_disconnect(&self) -> bool {
+        self.begin_stmt.is_none() && self.backend.done()
     }
 
     /// Current state.
@@ -195,6 +161,7 @@ impl QueryEngine {
                 query,
                 transaction_type,
                 extended,
+                ..
             } => {
                 self.start_transaction(context, query.clone(), *transaction_type, *extended)
                     .await?
@@ -230,6 +197,11 @@ impl QueryEngine {
                 context.params.rollback();
             }
             Command::Query(_) => self.execute(context).await?,
+            Command::Listen { .. } | Command::Notify { .. } | Command::Unlisten(_)
+                if self.backend.session_mode() =>
+            {
+                self.execute(context).await?
+            }
             Command::Listen { channel, shard } => {
                 self.listen(context, &channel.clone(), shard.clone())
                     .await?
@@ -243,11 +215,12 @@ impl QueryEngine {
                     .await?
             }
             Command::Unlisten(channel) => self.unlisten(context, &channel.clone()).await?,
-            Command::Set {
-                name, value, local, ..
-            } => {
-                self.set(context, name.clone(), value.clone(), *local)
-                    .await?;
+            Command::Set { params, .. } => {
+                let params = params.clone();
+                self.set(context, &params).await?;
+            }
+            Command::ResetAll => {
+                self.reset_all(context).await?;
             }
             Command::Copy(_) => self.execute(context).await?,
             Command::Deallocate => self.deallocate(context).await?,
@@ -296,5 +269,10 @@ impl QueryEngine {
 
     pub fn get_state(&self) -> State {
         self.stats.state
+    }
+
+    /// Check if the backend protocol is out of sync due to an error in extended protocol.
+    pub fn out_of_sync(&self) -> bool {
+        self.backend.out_of_sync()
     }
 }

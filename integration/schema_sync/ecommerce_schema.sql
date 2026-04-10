@@ -992,3 +992,284 @@ COMMENT ON TABLE core.users IS 'User accounts with role-based access control';
 COMMENT ON TABLE inventory.products IS 'Product catalog with full-text search capabilities';
 COMMENT ON TABLE sales.orders IS 'Customer orders partitioned by creation date';
 COMMENT ON TABLE inventory.stock_levels IS 'Inventory levels partitioned by warehouse';
+
+-- Simple tables with integer primary keys
+CREATE TABLE core.settings (
+  setting_id SERIAL PRIMARY KEY,
+  setting_key VARCHAR(100) NOT NULL UNIQUE,
+  setting_value TEXT
+);
+
+CREATE TABLE core.feature_flags (
+  flag_id INTEGER PRIMARY KEY,
+  flag_name VARCHAR(100) NOT NULL UNIQUE,
+  is_enabled BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE core.user_feature_overrides (
+  override_id SERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES core.users(user_id) ON DELETE CASCADE,
+  flag_id INTEGER NOT NULL REFERENCES core.feature_flags(flag_id) ON DELETE CASCADE,
+  is_enabled BOOLEAN NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(user_id, flag_id)
+);
+
+-- ============================================================================
+-- TABLE INHERITANCE WITH INTEGER PRIMARY KEYS
+-- ============================================================================
+
+-- Parent table for documents with integer primary key
+CREATE TABLE core.documents (
+  document_id SERIAL PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  content TEXT,
+  created_by BIGINT REFERENCES core.users(user_id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Child table inheriting from documents
+CREATE TABLE core.legal_documents (
+  effective_date DATE NOT NULL,
+  expiration_date DATE,
+  jurisdiction VARCHAR(100),
+  is_signed BOOLEAN NOT NULL DEFAULT FALSE
+) INHERITS (core.documents);
+
+-- Child table inheriting from documents
+CREATE TABLE core.technical_documents (
+  version VARCHAR(50) NOT NULL DEFAULT '1.0',
+  language VARCHAR(10) NOT NULL DEFAULT 'en',
+  is_draft BOOLEAN NOT NULL DEFAULT TRUE
+) INHERITS (core.documents);
+
+-- Parent table for notifications with integer primary key
+CREATE TABLE core.notifications (
+  notification_id SERIAL PRIMARY KEY,
+  user_id BIGINT REFERENCES core.users(user_id) ON DELETE CASCADE,
+  message TEXT NOT NULL,
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Child table: email notifications
+CREATE TABLE core.email_notifications (
+  email_address VARCHAR(255) NOT NULL,
+  subject VARCHAR(255) NOT NULL,
+  sent_at TIMESTAMPTZ,
+  delivery_status VARCHAR(50) DEFAULT 'pending'
+) INHERITS (core.notifications);
+
+-- Child table: push notifications
+CREATE TABLE core.push_notifications (
+  device_token VARCHAR(500) NOT NULL,
+  platform VARCHAR(20) NOT NULL,
+  sent_at TIMESTAMPTZ,
+  clicked_at TIMESTAMPTZ
+) INHERITS (core.notifications);
+
+-- Parent table for audit events with integer primary key
+CREATE TABLE audit.events (
+  event_id SERIAL PRIMARY KEY,
+  event_type VARCHAR(50) NOT NULL,
+  entity_type VARCHAR(50),
+  entity_id BIGINT,
+  actor_id BIGINT REFERENCES core.users(user_id),
+  event_data JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Child table: security events
+CREATE TABLE audit.security_events (
+  ip_address INET,
+  user_agent TEXT,
+  severity VARCHAR(20) NOT NULL DEFAULT 'info',
+  was_blocked BOOLEAN NOT NULL DEFAULT FALSE
+) INHERITS (audit.events);
+
+-- Child table: data change events
+CREATE TABLE audit.data_change_events (
+  old_values JSONB,
+  new_values JSONB,
+  changed_fields TEXT[]
+) INHERITS (audit.events);
+
+-- ============================================================================
+-- MATERIALIZED VIEWS ON TABLES WITH INTEGER PRIMARY KEYS
+-- ============================================================================
+
+-- Materialized view on documents (integer PK table with inheritance)
+CREATE MATERIALIZED VIEW analytics.document_summary AS
+SELECT
+  d.document_id,
+  d.title,
+  d.created_by,
+  u.username as created_by_username,
+  d.created_at,
+  d.updated_at
+FROM core.documents d
+LEFT JOIN core.users u ON d.created_by = u.user_id
+WITH DATA;
+
+CREATE UNIQUE INDEX idx_document_summary_pk ON analytics.document_summary(document_id);
+
+-- Materialized view on notifications (integer PK table with inheritance)
+CREATE MATERIALIZED VIEW analytics.notification_stats AS
+SELECT
+  n.notification_id,
+  n.user_id,
+  n.message,
+  n.is_read,
+  n.created_at
+FROM core.notifications n
+WITH DATA;
+
+CREATE UNIQUE INDEX idx_notification_stats_pk ON analytics.notification_stats(notification_id);
+
+-- Materialized view on audit events (integer PK table with inheritance)
+CREATE MATERIALIZED VIEW analytics.event_summary AS
+SELECT
+  e.event_id,
+  e.event_type,
+  e.entity_type,
+  e.entity_id,
+  e.actor_id,
+  u.username as actor_username,
+  e.created_at
+FROM audit.events e
+LEFT JOIN core.users u ON e.actor_id = u.user_id
+WITH DATA;
+
+CREATE UNIQUE INDEX idx_event_summary_pk ON analytics.event_summary(event_id);
+
+-- Materialized view on feature_flags (existing integer PK table)
+CREATE MATERIALIZED VIEW analytics.feature_flag_usage AS
+SELECT
+  ff.flag_id,
+  ff.flag_name,
+  ff.is_enabled as default_enabled,
+  COUNT(ufo.override_id) as override_count,
+  COUNT(ufo.override_id) FILTER (WHERE ufo.is_enabled = TRUE) as enabled_override_count,
+  COUNT(ufo.override_id) FILTER (WHERE ufo.is_enabled = FALSE) as disabled_override_count
+FROM core.feature_flags ff
+LEFT JOIN core.user_feature_overrides ufo ON ff.flag_id = ufo.flag_id
+GROUP BY ff.flag_id, ff.flag_name, ff.is_enabled
+WITH DATA;
+
+CREATE UNIQUE INDEX idx_feature_flag_usage_pk ON analytics.feature_flag_usage(flag_id);
+
+-- ============================================================================
+-- PARTITIONED TABLES WITH INTEGER PRIMARY KEYS
+-- ============================================================================
+
+-- Partitioned table with integer PK (range partitioned by category)
+CREATE TABLE inventory.price_history (
+  price_history_id SERIAL,
+  product_id BIGINT NOT NULL REFERENCES inventory.products(product_id) ON DELETE CASCADE,
+  price NUMERIC(12,2) NOT NULL,
+  currency_code CHAR(3) NOT NULL DEFAULT 'USD',
+  effective_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  effective_to TIMESTAMPTZ,
+  category_id INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (price_history_id, category_id)
+) PARTITION BY RANGE (category_id);
+
+CREATE TABLE inventory.price_history_cat_0_100 PARTITION OF inventory.price_history
+  FOR VALUES FROM (0) TO (100);
+CREATE TABLE inventory.price_history_cat_100_200 PARTITION OF inventory.price_history
+  FOR VALUES FROM (100) TO (200);
+CREATE TABLE inventory.price_history_cat_200_300 PARTITION OF inventory.price_history
+  FOR VALUES FROM (200) TO (300);
+CREATE TABLE inventory.price_history_cat_300_plus PARTITION OF inventory.price_history
+  FOR VALUES FROM (300) TO (MAXVALUE);
+
+CREATE INDEX idx_price_history_product ON inventory.price_history(product_id);
+CREATE INDEX idx_price_history_effective ON inventory.price_history(effective_from, effective_to);
+
+-- Partitioned table with integer PK (hash partitioned)
+CREATE TABLE core.session_data (
+  session_id SERIAL,
+  user_id BIGINT REFERENCES core.users(user_id) ON DELETE CASCADE,
+  session_token VARCHAR(255) NOT NULL,
+  ip_address INET,
+  user_agent TEXT,
+  data JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (session_id, user_id)
+) PARTITION BY HASH (user_id);
+
+CREATE TABLE core.session_data_p0 PARTITION OF core.session_data
+  FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE core.session_data_p1 PARTITION OF core.session_data
+  FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE core.session_data_p2 PARTITION OF core.session_data
+  FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE core.session_data_p3 PARTITION OF core.session_data
+  FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+CREATE INDEX idx_session_data_token ON core.session_data(session_token);
+CREATE INDEX idx_session_data_expires ON core.session_data(expires_at);
+
+-- Partitioned table with integer PK (list partitioned by status)
+CREATE TABLE sales.ticket_queue (
+  ticket_id SERIAL,
+  user_id BIGINT REFERENCES core.users(user_id),
+  subject VARCHAR(255) NOT NULL,
+  description TEXT,
+  priority INTEGER NOT NULL DEFAULT 3,
+  status VARCHAR(20) NOT NULL,
+  assigned_to BIGINT REFERENCES core.users(user_id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (ticket_id, status)
+) PARTITION BY LIST (status);
+
+CREATE TABLE sales.ticket_queue_open PARTITION OF sales.ticket_queue
+  FOR VALUES IN ('open');
+CREATE TABLE sales.ticket_queue_in_progress PARTITION OF sales.ticket_queue
+  FOR VALUES IN ('in_progress');
+CREATE TABLE sales.ticket_queue_resolved PARTITION OF sales.ticket_queue
+  FOR VALUES IN ('resolved');
+CREATE TABLE sales.ticket_queue_closed PARTITION OF sales.ticket_queue
+  FOR VALUES IN ('closed');
+
+CREATE INDEX idx_ticket_queue_user ON sales.ticket_queue(user_id);
+CREATE INDEX idx_ticket_queue_assigned ON sales.ticket_queue(assigned_to);
+CREATE INDEX idx_ticket_queue_priority ON sales.ticket_queue(priority, created_at);
+
+-- ============================================================================
+-- PARTITIONED TABLE WITH FK TO INTEGER PK
+-- Tests that child partitions inherit bigint conversion for FK columns
+-- ============================================================================
+
+-- Partitioned table with FK to integer PK table (core.feature_flags.flag_id)
+-- pg_dump only generates FK constraints for the parent table, not child partitions,
+-- so the schema sync needs to detect that child partitions should also have
+-- their flag_id column converted to bigint.
+CREATE TABLE core.feature_flag_audit (
+  audit_id SERIAL,
+  flag_id INTEGER NOT NULL REFERENCES core.feature_flags(flag_id) ON DELETE CASCADE,
+  user_id BIGINT REFERENCES core.users(user_id) ON DELETE SET NULL,
+  action VARCHAR(50) NOT NULL,
+  old_value BOOLEAN,
+  new_value BOOLEAN,
+  audit_date DATE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (audit_id, audit_date)
+) PARTITION BY RANGE (audit_date);
+
+CREATE TABLE core.feature_flag_audit_2025_q1 PARTITION OF core.feature_flag_audit
+  FOR VALUES FROM ('2025-01-01') TO ('2025-04-01');
+CREATE TABLE core.feature_flag_audit_2025_q2 PARTITION OF core.feature_flag_audit
+  FOR VALUES FROM ('2025-04-01') TO ('2025-07-01');
+CREATE TABLE core.feature_flag_audit_2025_q3 PARTITION OF core.feature_flag_audit
+  FOR VALUES FROM ('2025-07-01') TO ('2025-10-01');
+CREATE TABLE core.feature_flag_audit_2025_q4 PARTITION OF core.feature_flag_audit
+  FOR VALUES FROM ('2025-10-01') TO ('2026-01-01');
+
+CREATE INDEX idx_feature_flag_audit_flag ON core.feature_flag_audit(flag_id);
+CREATE INDEX idx_feature_flag_audit_user ON core.feature_flag_audit(user_id);
+CREATE INDEX idx_feature_flag_audit_date ON core.feature_flag_audit(audit_date);

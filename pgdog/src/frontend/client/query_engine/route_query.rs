@@ -1,4 +1,5 @@
 use pgdog_config::PoolerMode;
+use tokio::time::timeout;
 use tracing::trace;
 
 use super::*;
@@ -21,7 +22,7 @@ impl QueryEngine {
         context: &mut QueryEngineContext<'_>,
     ) -> Result<ClusterCheck, Error> {
         // Admin doesn't have a cluster.
-        if let Ok(cluster) = self.backend.cluster() {
+        let res = if let Ok(cluster) = self.backend.cluster() {
             if !context.in_transaction() && !cluster.online() {
                 let identifier = cluster.identifier();
 
@@ -43,6 +44,22 @@ impl QueryEngine {
             }
         } else {
             Ok(ClusterCheck::Ok)
+        };
+
+        if let Ok(ClusterCheck::Ok) = res {
+            // Make sure schema is loaded before we throw traffic
+            // at it. This matters for sharded deployments only.
+            if let Ok(cluster) = self.backend.cluster() {
+                timeout(
+                    context.timeouts.query_timeout(&State::Active),
+                    cluster.wait_schema_loaded(),
+                )
+                .await
+                .map_err(|_| Error::SchemaLoad)?;
+            }
+            res
+        } else {
+            res
         }
     }
 
@@ -79,6 +96,11 @@ impl QueryEngine {
                     context.client_request.messages,
                     command,
                 );
+
+                // Apply post-parser rewrites, e.g. offset/limit.
+                if let Some(ref rewrite_result) = &context.rewrite_result {
+                    rewrite_result.apply_after_parser(context.client_request)?;
+                }
             }
             Err(err) => {
                 self.error_response(context, ErrorResponse::syntax(err.to_string().as_str()))

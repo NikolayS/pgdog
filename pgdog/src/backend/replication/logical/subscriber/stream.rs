@@ -16,6 +16,7 @@ use pg_query::{
     NodeEnum,
 };
 use pgdog_config::QueryParserEngine;
+use pgdog_postgres_types::Oid;
 use tracing::{debug, trace};
 
 use super::super::{publisher::Table, Error};
@@ -29,7 +30,8 @@ use crate::{
             xlog_data::XLogPayload, Commit as XLogCommit, Delete as XLogDelete,
             Insert as XLogInsert, Relation, StatusUpdate, Update as XLogUpdate,
         },
-        Bind, CopyData, ErrorResponse, Execute, Flush, FromBytes, Parse, Protocol, Sync, ToBytes,
+        Bind, CommandComplete, CopyData, ErrorResponse, Execute, Flush, FromBytes, Parse, Protocol,
+        Sync, ToBytes,
     },
     util::postgres_now,
 };
@@ -63,6 +65,7 @@ struct Statements {
     upsert: Statement,
     update: Statement,
     delete: Statement,
+    omni: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -114,26 +117,29 @@ impl Statement {
         self.parse.query()
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StreamSubscriber {
     /// Destination cluster.
     cluster: Cluster,
 
     // Relation markers sent by the publisher.
     // Happens once per connection.
-    relations: HashMap<i32, Relation>,
+    relations: HashMap<Oid, Relation>,
 
     // Tables in the publication on the publisher.
     tables: HashMap<Key, Table>,
 
     // Statements
-    statements: HashMap<i32, Statements>,
-
-    // Partitioned tables dedup.
-    partitioned_dedup: HashSet<Key>,
+    statements: HashMap<Oid, Statements>,
+    // Mapping of table keys to their oid.
+    keys: HashMap<Key, Oid>,
 
     // LSNs for each table
-    table_lsns: HashMap<i32, i64>,
+    table_lsns: HashMap<Oid, i64>,
+
+    // Tables changed in the current transaction. We advance their replay
+    // watermark on commit so equal-LSN rows in the same transaction are not skipped.
+    changed_tables: HashSet<Oid>,
 
     // Connections to shards.
     connections: Vec<Server>,
@@ -141,12 +147,16 @@ pub struct StreamSubscriber {
     // Position in the WAL we have flushed successfully.
     lsn: i64,
     lsn_changed: bool,
+    in_transaction: bool,
 
     // Bytes sharded
     bytes_sharded: usize,
 
     // Query parser engine.
     query_parser_engine: QueryParserEngine,
+
+    // Missed rows.
+    missed_rows: MissedRows,
 }
 
 impl StreamSubscriber {
@@ -160,8 +170,8 @@ impl StreamSubscriber {
             cluster,
             relations: HashMap::new(),
             statements: HashMap::new(),
-            partitioned_dedup: HashSet::new(),
             table_lsns: HashMap::new(),
+            changed_tables: HashSet::new(),
             tables: tables
                 .iter()
                 .map(|table| {
@@ -178,7 +188,10 @@ impl StreamSubscriber {
             lsn: 0, // Unknown,
             bytes_sharded: 0,
             lsn_changed: true,
+            in_transaction: false,
             query_parser_engine,
+            missed_rows: MissedRows::default(),
+            keys: HashMap::default(),
         }
     }
 
@@ -228,25 +241,59 @@ impl StreamSubscriber {
         Ok(())
     }
 
-    // Send a statement to one or more shards.
+    // Send a statement to one or more matching shards.
     async fn send(&mut self, val: &Shard, bind: &Bind) -> Result<(), Error> {
-        for (shard, conn) in self.connections.iter_mut().enumerate() {
-            match val {
-                Shard::Direct(direct) => {
-                    if shard != *direct {
-                        continue;
-                    }
-                }
-                Shard::Multi(multi) => {
-                    if multi.contains(&shard) {
-                        continue;
-                    }
-                }
-                _ => (),
-            }
+        let mut conns: Vec<_> = self
+            .connections
+            .iter_mut()
+            .enumerate()
+            .filter(|(shard, _)| match val {
+                Shard::Direct(direct) => *shard == *direct,
+                Shard::Multi(multi) => multi.contains(shard),
+                _ => true,
+            })
+            .map(|(_, server)| server)
+            .collect();
 
+        for conn in &mut conns {
             conn.send(&vec![bind.clone().into(), Execute::new().into(), Flush.into()].into())
                 .await?;
+        }
+
+        for conn in &mut conns {
+            conn.flush().await?;
+        }
+
+        for conn in &mut conns {
+            // Keep server connections always synchronized.
+            for _ in 0..2 {
+                let msg = conn.read().await?;
+                match msg.code() {
+                    'C' => {
+                        let cmd = CommandComplete::try_from(msg)?;
+                        let rows = cmd
+                            .rows()?
+                            .ok_or(Error::CommandCompleteNoRows(cmd.clone()))?;
+                        // A direct-to-shard update indicates a row has changed on source.
+                        // This row must exist on the destination, or we missed some data during sync.
+                        if rows == 0 && val.is_direct() {
+                            match cmd.tag() {
+                                "UPDATE" => self.missed_rows.update += 1,
+                                "DELETE" => self.missed_rows.delete += 1,
+                                "INSERT" => self.missed_rows.insert += 1,
+                                _ => (),
+                            }
+                        }
+                    }
+                    '2' => (),
+                    'E' => {
+                        return Err(Error::PgError(Box::new(ErrorResponse::from_bytes(
+                            msg.to_bytes()?,
+                        )?)))
+                    }
+                    c => return Err(Error::SendOutOfSync(c)),
+                }
+            }
         }
 
         Ok(())
@@ -264,16 +311,22 @@ impl StreamSubscriber {
         if let Some(statements) = self.statements.get(&insert.oid) {
             // Convert TupleData into a Bind message. We can now insert that tuple
             // using a prepared statement.
-            let mut context =
-                StreamContext::new(&self.cluster, &insert.tuple_data, statements.insert.parse());
+            let mut context = StreamContext::new(
+                &self.cluster,
+                &insert.tuple_data,
+                if statements.omni {
+                    statements.upsert.parse()
+                } else {
+                    statements.insert.parse()
+                },
+            );
             let bind = context.bind().clone();
             let shard = context.shard()?;
 
             self.send(&shard, &bind).await?;
         }
 
-        // Update table LSN.
-        self.table_lsns.insert(insert.oid, self.lsn);
+        self.mark_table_changed(insert.oid);
 
         Ok(())
     }
@@ -311,8 +364,7 @@ impl StreamSubscriber {
             }
         }
 
-        // Update table LSN.
-        self.table_lsns.insert(update.oid, self.lsn);
+        self.mark_table_changed(update.oid);
 
         Ok(())
     }
@@ -323,8 +375,6 @@ impl StreamSubscriber {
         }
 
         if let Some(statements) = self.statements.get(&delete.oid) {
-            // Convert TupleData into a Bind message. We can now insert that tuple
-            // using a prepared statement.
             if let Some(key) = delete.key_non_null() {
                 let mut context =
                     StreamContext::new(&self.cluster, &key, statements.delete.parse());
@@ -335,21 +385,29 @@ impl StreamSubscriber {
             }
         }
 
-        // Update table LSN.
-        self.table_lsns.insert(delete.oid, self.lsn);
+        self.mark_table_changed(delete.oid);
 
         Ok(())
     }
 
-    fn lsn_applied(&self, oid: &i32) -> bool {
+    pub(crate) fn lsn_applied(&self, oid: &Oid) -> bool {
         if let Some(table_lsn) = self.table_lsns.get(oid) {
-            // Don't apply change if table is ahead.
-            if self.lsn < *table_lsn {
+            // Don't apply change if the table has already been copied or replayed
+            // through this transaction boundary.
+            if self.lsn <= *table_lsn {
                 return true;
             }
         }
 
         false
+    }
+
+    fn mark_table_changed(&mut self, oid: Oid) {
+        if self.in_transaction {
+            self.changed_tables.insert(oid);
+        } else {
+            self.table_lsns.insert(oid, self.lsn);
+        }
     }
 
     // Handle Commit message.
@@ -362,21 +420,23 @@ impl StreamSubscriber {
         }
         for server in &mut self.connections {
             // Drain responses from server.
-            loop {
-                let msg = server.read().await?;
-                trace!("[{}] --> {:?}", server.addr(), msg);
+            let msg = server.read().await?;
+            trace!("[{}] --> {:?}", server.addr(), msg);
 
-                match msg.code() {
-                    'E' => {
-                        return Err(Error::PgError(Box::new(ErrorResponse::from_bytes(
-                            msg.to_bytes()?,
-                        )?)))
-                    }
-                    'Z' => break,
-                    '2' | 'C' => continue,
-                    c => return Err(Error::CommitOutOfSync(c)),
+            match msg.code() {
+                'E' => {
+                    return Err(Error::PgError(Box::new(ErrorResponse::from_bytes(
+                        msg.to_bytes()?,
+                    )?)))
                 }
+                'Z' => (),
+                c => return Err(Error::CommitOutOfSync(c)),
             }
+        }
+
+        let transaction_lsn = self.lsn;
+        for oid in self.changed_tables.drain() {
+            self.table_lsns.insert(oid, transaction_lsn);
         }
 
         self.set_current_lsn(commit.end_lsn);
@@ -405,67 +465,78 @@ impl StreamSubscriber {
                 name: table.table.destination_name().to_string(),
             };
 
-            if self.partitioned_dedup.contains(&dest_key) {
+            // Partition child tables target the parent on the destination shard,
+            // we don't need to prepare the same statement per child.
+            if let Some(oid) = self.keys.get(&dest_key) {
+                let statements = self.statements.get(oid).ok_or(Error::MissingKey)?;
+                self.statements.insert(relation.oid, statements.clone());
+
                 debug!("queries for table {} already prepared", dest_key);
-                return Ok(());
-            }
+            } else {
+                let insert = Statement::new(&table.insert(false), self.query_parser_engine)?;
+                let upsert = Statement::new(&table.insert(true), self.query_parser_engine)?;
+                let update = Statement::new(&table.update(), self.query_parser_engine)?;
+                let delete = Statement::new(&table.delete(), self.query_parser_engine)?;
 
-            let insert = Statement::new(&table.insert(false), self.query_parser_engine)?;
-            let upsert = Statement::new(&table.insert(true), self.query_parser_engine)?;
-            let update = Statement::new(&table.update(), self.query_parser_engine)?;
-            let delete = Statement::new(&table.delete(), self.query_parser_engine)?;
+                for server in &mut self.connections {
+                    for stmt in &[&insert, &upsert, &update, &delete] {
+                        debug!("preparing \"{}\" [{}]", stmt.query(), server.addr());
+                    }
 
-            for server in &mut self.connections {
-                for stmt in &[&insert, &upsert, &update, &delete] {
-                    debug!("preparing \"{}\" [{}]", stmt.query(), server.addr());
+                    server
+                        .send(
+                            &vec![
+                                insert.parse().clone().into(),
+                                upsert.parse().clone().into(),
+                                update.parse().clone().into(),
+                                delete.parse().clone().into(),
+                                if self.in_transaction {
+                                    Flush.into()
+                                } else {
+                                    Sync.into()
+                                },
+                            ]
+                            .into(),
+                        )
+                        .await?;
                 }
 
-                server
-                    .send(
-                        &vec![
-                            insert.parse().clone().into(),
-                            upsert.parse().clone().into(),
-                            update.parse().clone().into(),
-                            delete.parse().clone().into(),
-                            Sync.into(),
-                        ]
-                        .into(),
-                    )
-                    .await?;
-            }
+                for server in &mut self.connections {
+                    let num_messages = if self.in_transaction { 4 } else { 5 };
+                    for _ in 0..num_messages {
+                        let msg = server.read().await?;
+                        trace!("[{}] --> {:?}", server.addr(), msg);
 
-            for server in &mut self.connections {
-                loop {
-                    let msg = server.read().await?;
-                    trace!("[{}] --> {:?}", server.addr(), msg);
-
-                    match msg.code() {
-                        'E' => {
-                            return Err(Error::PgError(Box::new(ErrorResponse::from_bytes(
-                                msg.to_bytes()?,
-                            )?)))
+                        match msg.code() {
+                            'E' => {
+                                return Err(Error::PgError(Box::new(ErrorResponse::from_bytes(
+                                    msg.to_bytes()?,
+                                )?)))
+                            }
+                            'Z' => break,
+                            '1' => continue,
+                            c => return Err(Error::RelationOutOfSync(c)),
                         }
-                        'Z' => break,
-                        '1' => continue,
-                        c => return Err(Error::RelationOutOfSync(c)),
                     }
                 }
-            }
 
-            self.statements.insert(
-                relation.oid,
-                Statements {
-                    insert,
-                    upsert,
-                    update,
-                    delete,
-                },
-            );
+                self.statements.insert(
+                    relation.oid,
+                    Statements {
+                        insert,
+                        upsert,
+                        update,
+                        delete,
+                        omni: !table.is_sharded(&self.cluster.sharding_schema().tables),
+                    },
+                );
+
+                self.keys.insert(dest_key, relation.oid);
+            }
 
             // Only record tables we expect to stream changes for.
             self.table_lsns.insert(relation.oid, table.lsn.lsn);
             self.relations.insert(relation.oid, relation);
-            self.partitioned_dedup.insert(dest_key);
         }
 
         Ok(())
@@ -491,10 +562,13 @@ impl StreamSubscriber {
                     XLogPayload::Commit(commit) => {
                         self.commit(commit).await?;
                         status_update = Some(self.status_update());
+                        self.in_transaction = false;
                     }
                     XLogPayload::Relation(relation) => self.relation(relation).await?,
                     XLogPayload::Begin(begin) => {
+                        self.changed_tables.clear();
                         self.set_current_lsn(begin.final_transaction_lsn);
+                        self.in_transaction = true;
                     }
                     _ => (),
                 }
@@ -539,5 +613,107 @@ impl StreamSubscriber {
     /// Lsn changed since the last time we updated it.
     pub fn lsn_changed(&self) -> bool {
         self.lsn_changed
+    }
+
+    /// Whether we are inside a transaction.
+    #[cfg(test)]
+    pub(crate) fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
+    /// Get and reset missing rows.
+    pub(crate) fn missed_rows(&mut self) -> MissedRows {
+        std::mem::take(&mut self.missed_rows)
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MissedRows {
+    insert: usize,
+    delete: usize,
+    update: usize,
+}
+
+impl MissedRows {
+    pub(crate) fn non_zero(&self) -> bool {
+        self.insert > 0 || self.delete > 0 || self.update > 0
+    }
+}
+
+impl Display for MissedRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut written = false;
+        if self.insert > 0 {
+            write!(f, "insert={}", self.insert)?;
+            written = true;
+        }
+        if self.update > 0 {
+            write!(
+                f,
+                "{}update={}",
+                if written { " " } else { "" },
+                self.update
+            )?;
+            written = true;
+        }
+        if self.delete > 0 {
+            write!(
+                f,
+                "{}delete={}",
+                if written { " " } else { "" },
+                self.delete
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::config;
+
+    fn make_subscriber() -> StreamSubscriber {
+        let cluster = Cluster::new_test(&config());
+        StreamSubscriber::new(&cluster, &[], QueryParserEngine::default())
+    }
+
+    #[test]
+    fn lsn_gating_is_inclusive_at_copy_boundary() {
+        let mut sub = make_subscriber();
+        let oid = Oid(42);
+
+        sub.table_lsns.insert(oid, 100);
+        sub.set_current_lsn(100);
+
+        assert!(sub.lsn_applied(&oid));
+    }
+
+    #[tokio::test]
+    async fn table_watermarks_advance_on_commit() {
+        let mut sub = make_subscriber();
+        let oid = Oid(42);
+
+        sub.table_lsns.insert(oid, 50);
+        sub.in_transaction = true;
+        sub.set_current_lsn(100);
+        sub.mark_table_changed(oid);
+
+        // Rows from the current transaction must remain eligible until commit.
+        assert!(!sub.lsn_applied(&oid));
+
+        sub.commit(XLogCommit {
+            flags: 0,
+            commit_lsn: 0,
+            end_lsn: 200,
+            commit_timestamp: 0,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sub.table_lsns.get(&oid), Some(&100));
+        assert_eq!(sub.lsn(), 200);
+        assert!(sub.changed_tables.is_empty());
     }
 }

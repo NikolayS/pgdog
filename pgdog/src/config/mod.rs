@@ -18,15 +18,15 @@ pub mod users;
 pub use core::{Config, ConfigAndUsers};
 pub use database::{Database, Role};
 pub use error::Error;
-pub use general::General;
+pub use general::{General, LogFormat};
 pub use memory::*;
 pub use networking::{MultiTenant, Tcp, TlsVerifyMode};
 pub use overrides::Overrides;
-pub use pgdog_config::auth::{AuthType, PassthoughAuth};
+pub use pgdog_config::auth::{AuthType, PassthroughAuth};
 pub use pgdog_config::{LoadBalancingStrategy, ReadWriteSplit, ReadWriteStrategy};
-pub use pooling::{ConnectionRecovery, PoolerMode, PreparedStatements, Stats};
+pub use pooling::{ConnectionRecovery, PoolerMode, PreparedStatements};
 pub use rewrite::{Rewrite, RewriteMode};
-pub use users::{Admin, Plugin, User, Users};
+pub use users::{Admin, Plugin, ServerAuth, User, Users};
 
 // Re-export from sharding module
 pub use sharding::{
@@ -61,7 +61,7 @@ pub fn load(config: &PathBuf, users: &PathBuf) -> Result<ConfigAndUsers, Error> 
 }
 
 pub fn set(mut config: ConfigAndUsers) -> Result<ConfigAndUsers, Error> {
-    config.config.check();
+    config.check()?;
     for table in config.config.sharded_tables.iter_mut() {
         table.load_centroids()?;
     }
@@ -207,52 +207,46 @@ pub fn load_test_replicas() {
 
 #[cfg(test)]
 pub fn load_test_sharded() {
-    use pgdog_config::ShardedSchema;
+    load_test_sharded_n(2);
+}
+
+/// Load 3-shard test configuration.
+pub fn load_test_sharded_3() {
+    load_test_sharded_n(3);
+}
+
+fn load_test_sharded_n(num_shards: usize) {
+    use pgdog_config::{OmnishardedTables, ShardedSchema};
 
     use crate::backend::databases::init;
 
     let mut config = ConfigAndUsers::default();
     config.config.general.min_pool_size = 0;
-    config.config.databases = vec![
-        Database {
-            name: "pgdog".into(),
-            host: "127.0.0.1".into(),
-            port: 5432,
-            role: Role::Primary,
-            database_name: Some("shard_0".into()),
-            shard: 0,
-            ..Default::default()
-        },
-        Database {
-            name: "pgdog".into(),
-            host: "127.0.0.1".into(),
-            port: 5432,
-            role: Role::Replica,
-            read_only: Some(true),
-            database_name: Some("shard_0".into()),
-            shard: 0,
-            ..Default::default()
-        },
-        Database {
-            name: "pgdog".into(),
-            host: "127.0.0.1".into(),
-            port: 5432,
-            role: Role::Primary,
-            database_name: Some("shard_1".into()),
-            shard: 1,
-            ..Default::default()
-        },
-        Database {
-            name: "pgdog".into(),
-            host: "127.0.0.1".into(),
-            port: 5432,
-            role: Role::Replica,
-            read_only: Some(true),
-            database_name: Some("shard_1".into()),
-            shard: 1,
-            ..Default::default()
-        },
-    ];
+    config.config.databases = (0..num_shards)
+        .flat_map(|shard| {
+            vec![
+                Database {
+                    name: "pgdog".into(),
+                    host: "127.0.0.1".into(),
+                    port: 5432,
+                    role: Role::Primary,
+                    database_name: Some(format!("shard_{}", shard)),
+                    shard,
+                    ..Default::default()
+                },
+                Database {
+                    name: "pgdog".into(),
+                    host: "127.0.0.1".into(),
+                    port: 5432,
+                    role: Role::Replica,
+                    read_only: Some(true),
+                    database_name: Some(format!("shard_{}", shard)),
+                    shard,
+                    ..Default::default()
+                },
+            ]
+        })
+        .collect();
     config.config.sharded_tables = vec![
         ShardedTable {
             database: "pgdog".into(),
@@ -295,6 +289,11 @@ pub fn load_test_sharded() {
             ..Default::default()
         },
     ];
+    config.config.omnisharded_tables = vec![OmnishardedTables {
+        database: "pgdog".into(),
+        tables: vec!["sharded_omni".into()],
+        sticky: false,
+    }];
     config.config.rewrite.enabled = true;
     config.config.rewrite.split_inserts = RewriteMode::Rewrite;
     config.config.rewrite.shard_key = RewriteMode::Rewrite;

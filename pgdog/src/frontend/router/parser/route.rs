@@ -81,7 +81,7 @@ pub struct Route {
     order_by: Vec<OrderBy>,
     aggregate: Aggregate,
     limit: Limit,
-    lock_session: bool,
+    lock_session: Option<bool>,
     distinct: Option<DistinctBy>,
     maintenance: bool,
     rewrite_plan: AggregateRewritePlan,
@@ -89,6 +89,7 @@ pub struct Route {
     explain: Option<ExplainTrace>,
     rollback_savepoint: bool,
     search_path_driven: bool,
+    schema_changed: bool,
 }
 
 impl Display for Route {
@@ -198,6 +199,19 @@ impl Route {
         self
     }
 
+    pub fn set_schema_changed(&mut self, changed: bool) {
+        self.schema_changed = changed;
+    }
+
+    pub fn is_schema_changed(&self) -> bool {
+        self.schema_changed
+    }
+
+    pub fn with_schema_changed(mut self, changed: bool) -> Self {
+        self.schema_changed = changed;
+        self
+    }
+
     pub fn set_search_path_driven_mut(&mut self, schema_driven: bool) {
         self.search_path_driven = schema_driven;
     }
@@ -215,11 +229,18 @@ impl Route {
     }
 
     pub fn should_buffer(&self) -> bool {
-        !self.order_by().is_empty() || !self.aggregate().is_empty() || self.distinct().is_some()
+        !self.order_by().is_empty()
+            || !self.aggregate().is_empty()
+            || self.distinct().is_some()
+            || self.limit().offset.is_some()
     }
 
     pub fn limit(&self) -> &Limit {
         &self.limit
+    }
+
+    pub fn set_limit(&mut self, limit: Limit) {
+        self.limit = limit;
     }
 
     pub fn with_read(mut self, read: bool) -> Self {
@@ -252,22 +273,35 @@ impl Route {
         self.rollback_savepoint
     }
 
-    pub fn with_write(mut self, write: FunctionBehavior) -> Self {
-        self.set_write(write);
+    pub fn with_functions(mut self, function: FunctionBehavior) -> Self {
+        self.set_functions(function);
         self
     }
 
-    pub fn set_write(&mut self, write: FunctionBehavior) {
+    pub fn set_functions(&mut self, function: FunctionBehavior) {
         let FunctionBehavior {
             writes,
             locking_behavior,
-        } = write;
+            ..
+        } = function;
         self.read = !writes;
-        self.lock_session = matches!(locking_behavior, LockingBehavior::Lock);
+        self.lock_session = match locking_behavior {
+            LockingBehavior::Lock => Some(true),
+            LockingBehavior::Unlock => Some(false),
+            LockingBehavior::None => None,
+        };
     }
 
     pub fn is_lock_session(&self) -> bool {
+        self.lock_session == Some(true)
+    }
+
+    pub fn lock_session(&self) -> Option<bool> {
         self.lock_session
+    }
+
+    pub fn is_unlock_session(&self) -> bool {
+        self.lock_session == Some(false)
     }
 
     pub fn distinct(&self) -> &Option<DistinctBy> {
@@ -285,6 +319,14 @@ impl Route {
     pub fn with_aggregate_rewrite_plan_mut(&mut self, plan: AggregateRewritePlan) {
         self.rewrite_plan = plan;
     }
+
+    /// This route is for an omnisharded table.
+    pub fn is_omni(&self) -> bool {
+        matches!(
+            self.shard.source(),
+            ShardSource::Table(TableReason::Omni) | ShardSource::RoundRobin(RoundRobinReason::Omni)
+        )
+    }
 }
 
 /// Shard source.
@@ -298,7 +340,7 @@ impl Route {
 pub enum ShardSource {
     #[default]
     DefaultUnset,
-    Table,
+    Table(TableReason),
     RoundRobin(RoundRobinReason),
     SearchPath(String),
     Set,
@@ -323,6 +365,13 @@ pub enum OverrideReason {
     Transaction,
     OnlyOneShard,
     RewriteUpdate,
+    CrossShardFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub enum TableReason {
+    Omni,
+    Sharded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Default)]
@@ -351,7 +400,14 @@ impl ShardWithPriority {
     pub fn new_table(shard: Shard) -> Self {
         Self {
             shard,
-            source: ShardSource::Table,
+            source: ShardSource::Table(TableReason::Sharded),
+        }
+    }
+
+    pub fn new_table_omni(shard: Shard) -> Self {
+        Self {
+            shard,
+            source: ShardSource::Table(TableReason::Omni),
         }
     }
 
@@ -367,6 +423,13 @@ impl ShardWithPriority {
         Self {
             shard,
             source: ShardSource::Override(OverrideReason::RewriteUpdate),
+        }
+    }
+
+    pub fn new_override_cross_shard_function() -> Self {
+        Self {
+            shard: Shard::All,
+            source: ShardSource::Override(OverrideReason::CrossShardFunction),
         }
     }
 
@@ -449,7 +512,6 @@ impl ShardWithPriority {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn source(&self) -> &ShardSource {
         &self.source
     }
@@ -516,8 +578,11 @@ mod test {
 
     #[test]
     fn test_source_ord() {
-        assert!(ShardSource::Table < ShardSource::RoundRobin(RoundRobinReason::NotExecutable));
-        assert!(ShardSource::Table < ShardSource::SearchPath(String::new()));
+        assert!(
+            ShardSource::Table(TableReason::Sharded)
+                < ShardSource::RoundRobin(RoundRobinReason::NotExecutable)
+        );
+        assert!(ShardSource::Table(TableReason::Omni) < ShardSource::SearchPath(String::new()));
         assert!(ShardSource::SearchPath(String::new()) < ShardSource::Set);
         assert!(ShardSource::Set < ShardSource::Comment);
         assert!(ShardSource::Comment < ShardSource::Override(OverrideReason::OnlyOneShard));
@@ -547,6 +612,81 @@ mod test {
             ShardWithPriority::new_comment(shard.clone())
                 < ShardWithPriority::new_override_dry_run(shard.clone())
         );
+    }
+
+    #[test]
+    fn test_should_buffer_empty_route() {
+        let route = Route::default();
+        assert!(!route.should_buffer());
+    }
+
+    #[test]
+    fn test_should_buffer_order_by() {
+        let route = Route::select(
+            ShardWithPriority::new_table(Shard::All),
+            vec![OrderBy::Asc(0)],
+            Default::default(),
+            Limit::default(),
+            None,
+        );
+        assert!(route.should_buffer());
+    }
+
+    #[test]
+    fn test_should_buffer_limit_only() {
+        let route = Route::select(
+            ShardWithPriority::new_table(Shard::All),
+            vec![],
+            Default::default(),
+            Limit {
+                limit: Some(10),
+                offset: None,
+            },
+            None,
+        );
+        assert!(!route.should_buffer());
+    }
+
+    #[test]
+    fn test_should_buffer_offset_only() {
+        let route = Route::select(
+            ShardWithPriority::new_table(Shard::All),
+            vec![],
+            Default::default(),
+            Limit {
+                limit: None,
+                offset: Some(5),
+            },
+            None,
+        );
+        assert!(route.should_buffer());
+    }
+
+    #[test]
+    fn test_should_buffer_limit_and_offset() {
+        let route = Route::select(
+            ShardWithPriority::new_table(Shard::All),
+            vec![],
+            Default::default(),
+            Limit {
+                limit: Some(10),
+                offset: Some(5),
+            },
+            None,
+        );
+        assert!(route.should_buffer());
+    }
+
+    #[test]
+    fn test_should_buffer_no_limit_no_offset() {
+        let route = Route::select(
+            ShardWithPriority::new_table(Shard::All),
+            vec![],
+            Default::default(),
+            Limit::default(),
+            None,
+        );
+        assert!(!route.should_buffer());
     }
 
     #[test]

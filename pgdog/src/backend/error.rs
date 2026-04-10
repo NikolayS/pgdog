@@ -15,6 +15,9 @@ pub enum Error {
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),
 
+    #[error("type: {0}")]
+    Type(#[from] pgdog_postgres_types::Error),
+
     #[error("unexpected message: {0}")]
     UnexpectedMessage(char),
 
@@ -114,6 +117,9 @@ pub enum Error {
     #[error("could not resolve to any address for hostname {0}")]
     DnsResolutionFailed(String),
 
+    #[error("RDS IAM token generation failed: {0}")]
+    RdsIamToken(String),
+
     #[error("pub/sub channel disabled")]
     PubSubDisabled,
 
@@ -131,6 +137,9 @@ pub enum Error {
 
     #[error("unsupported aggregation {function}: {reason}")]
     UnsupportedAggregation { function: String, reason: String },
+
+    #[error("toml: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 }
 
 impl From<crate::frontend::Error> for Error {

@@ -99,7 +99,7 @@ mod tests {
 
         for i in 0..num_tasks {
             let pool_clone = pool.clone();
-            let request = Request::new(BackendKeyData::new());
+            let request = Request::unrouted(BackendKeyData::new());
             let mut waiting = Waiting::new(pool_clone, &request).unwrap();
 
             let wait_task = tokio::spawn(async move { waiting.wait().await });
@@ -137,10 +137,12 @@ mod tests {
     #[tokio::test]
     async fn test_timeout_removes_waiter() {
         let config = crate::backend::pool::Config {
-            max: 1,
-            min: 1,
-            checkout_timeout: Duration::from_millis(10),
-            ..Default::default()
+            inner: pgdog_stats::Config {
+                max: 1,
+                min: 1,
+                checkout_timeout: Duration::from_millis(10),
+                ..crate::backend::pool::Config::default().inner
+            },
         };
 
         let pool = Pool::new(&crate::backend::pool::PoolConfig {
@@ -149,7 +151,7 @@ mod tests {
                 port: 5432,
                 database_name: "pgdog".into(),
                 user: "pgdog".into(),
-                password: "pgdog".into(),
+                passwords: vec!["pgdog".into()],
                 ..Default::default()
             },
             config,
@@ -160,7 +162,7 @@ mod tests {
 
         let _conn = pool.get(&Request::default()).await.unwrap();
 
-        let request = Request::new(BackendKeyData::new());
+        let request = Request::unrouted(BackendKeyData::new());
         let waiter_pool = pool.clone();
         let get_conn = async move {
             let mut waiting = Waiting::new(waiter_pool.clone(), &request).unwrap();

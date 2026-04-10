@@ -1,5 +1,5 @@
 use tokio::time::timeout;
-use tracing::trace;
+use tracing::{info, trace};
 
 use crate::{
     frontend::{
@@ -15,6 +15,7 @@ use crate::{
 
 use tracing::{debug, error};
 
+use super::hooks::schema::schema_changed;
 use super::*;
 
 impl QueryEngine {
@@ -57,6 +58,28 @@ impl QueryEngine {
             }
         }
 
+        match timeout(
+            context.timeouts.query_timeout(&State::Active),
+            self.client_server_exchange(context),
+        )
+        .await
+        {
+            Ok(response) => response?,
+            Err(err) => {
+                // Close the conn, it could be stuck executing a query
+                // or dead.
+                self.backend.force_close();
+                return Err(err.into());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn client_server_exchange(
+        &mut self,
+        context: &mut QueryEngineContext<'_>,
+    ) -> Result<(), Error> {
         match context.rewrite_result.take() {
             Some(RewriteResult::InsertSplit(requests)) => {
                 multi_step::InsertMulti::from_engine(self, requests)
@@ -64,7 +87,7 @@ impl QueryEngine {
                     .await?;
             }
 
-            Some(RewriteResult::InPlace) | None => {
+            Some(RewriteResult::InPlace { .. }) | None => {
                 self.backend
                     .handle_client_request(context.client_request, &mut self.router, self.streaming)
                     .await?;
@@ -72,9 +95,8 @@ impl QueryEngine {
                 while self.backend.has_more_messages()
                     && !self.backend.in_copy_mode()
                     && !self.streaming
-                    && !self.test_mode.enabled
                 {
-                    let message = self.read_server_message(context).await?;
+                    let message = self.read_server_message().await?;
                     self.process_server_message(context, message).await?;
                 }
             }
@@ -89,32 +111,14 @@ impl QueryEngine {
         Ok(())
     }
 
-    pub async fn read_server_message(
-        &mut self,
-        context: &mut QueryEngineContext<'_>,
-    ) -> Result<Message, Error> {
-        let message = match timeout(
-            context.timeouts.query_timeout(&State::Active),
-            self.backend.read(),
-        )
-        .await
-        {
-            Ok(response) => response?,
-            Err(err) => {
-                // Close the conn, it could be stuck executing a query
-                // or dead.
-                self.backend.force_close();
-                return Err(err.into());
-            }
-        };
-
-        Ok(message)
+    pub async fn read_server_message(&mut self) -> Result<Message, Error> {
+        Ok(self.backend.read().await?)
     }
 
     pub async fn process_server_message(
         &mut self,
         context: &mut QueryEngineContext<'_>,
-        message: Message,
+        mut message: Message,
     ) -> Result<(), Error> {
         self.streaming = message.streaming();
 
@@ -124,7 +128,6 @@ impl QueryEngine {
         } else {
             None
         };
-        let mut message = message.backend();
         let has_more_messages = self.backend.has_more_messages();
 
         if let Some(bytes) = payload {
@@ -226,7 +229,7 @@ impl QueryEngine {
         self.stats.sent(message.len());
 
         // Do this before flushing, because flushing can take time.
-        self.cleanup_backend(context);
+        self.cleanup_backend(context)?;
 
         trace!("{:#?} >>> {:?}", message, context.stream.peer_addr());
 
@@ -272,7 +275,10 @@ impl QueryEngine {
         Ok(())
     }
 
-    pub(super) fn cleanup_backend(&mut self, context: &mut QueryEngineContext<'_>) {
+    pub(super) fn cleanup_backend(
+        &mut self,
+        context: &mut QueryEngineContext<'_>,
+    ) -> Result<(), Error> {
         if self.backend.done() {
             let changed_params = self.backend.changed_params();
 
@@ -280,6 +286,21 @@ impl QueryEngine {
             // Flushing can take a minute and we don't want to block the connection from being reused.
             if !self.backend.session_mode() && context.requests_left == 0 {
                 self.backend.disconnect();
+            }
+
+            // Detect schema change and relaod the config so we get new schema.
+            if self.router.schema_changed()
+                && self
+                    .backend
+                    .cluster()
+                    .map(|cluster| cluster.reload_schema())
+                    .unwrap_or_default()
+            {
+                info!(
+                    "schema change detected, reloading config [{}]",
+                    self.backend.cluster()?.identifier(),
+                );
+                schema_changed()?;
             }
 
             self.router.reset();
@@ -299,6 +320,8 @@ impl QueryEngine {
                 self.comms.update_params(context.params);
             }
         }
+
+        Ok(())
     }
 
     // Perform cross-shard check.

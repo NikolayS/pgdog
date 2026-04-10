@@ -12,9 +12,14 @@ use super::{
     Value,
 };
 use crate::{
-    backend::ShardingSchema,
-    frontend::router::{parser::Shard, sharding::ContextBuilder, sharding::SchemaSharder},
-    net::Bind,
+    backend::{Schema, ShardingSchema},
+    config::ShardedTable,
+    frontend::router::{
+        parser::{ee::ParserHooks, Shard},
+        round_robin,
+        sharding::{ContextBuilder, SchemaSharder, Tables},
+    },
+    net::{parameter::ParameterValue, Bind},
 };
 
 /// Context for searching a SELECT statement, tracking table aliases.
@@ -162,11 +167,29 @@ enum Statement<'a> {
     Insert(&'a InsertStmt),
 }
 
+/// Context for looking up table columns from the database schema.
+/// Used for INSERT statements without explicit column lists.
+pub struct SchemaLookupContext<'a> {
+    /// The loaded database schema.
+    pub db_schema: &'a Schema,
+    /// The database user (for resolving $user in search_path).
+    pub user: &'a str,
+    /// The search_path parameter (for table resolution).
+    pub search_path: Option<&'a ParameterValue>,
+}
+
 pub struct StatementParser<'a, 'b, 'c> {
     stmt: Statement<'a>,
     bind: Option<&'b Bind>,
     schema: &'b ShardingSchema,
     recorder: Option<&'c mut ExplainRecorder>,
+    /// Optional schema lookup context for INSERT without column list.
+    schema_lookup: Option<SchemaLookupContext<'b>>,
+    hooks: ParserHooks,
+    /// Cached extracted tables (None = not yet computed)
+    cached_tables: Option<Vec<Table<'a>>>,
+    /// Cached result of all_omnisharded check (None = not yet computed)
+    all_omnisharded: Option<bool>,
 }
 
 impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
@@ -181,7 +204,45 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
             bind,
             schema,
             recorder,
+            schema_lookup: None,
+            hooks: ParserHooks::default(),
+            cached_tables: None,
+            all_omnisharded: None,
         }
+    }
+
+    /// Get extracted tables, caching the result.
+    fn tables(&mut self) -> &[Table<'a>] {
+        if self.cached_tables.is_none() {
+            self.cached_tables = Some(self.extract_tables());
+        }
+        self.cached_tables.as_ref().unwrap()
+    }
+
+    /// Check if all tables in the query are in the omnisharded config.
+    /// Result is cached after first computation.
+    fn is_all_omnisharded(&mut self) -> bool {
+        if let Some(cached) = self.all_omnisharded {
+            return cached;
+        }
+
+        let omnishards = self.schema.tables.omnishards();
+        let tables = self.tables();
+
+        let result = !omnishards.is_empty()
+            && !tables.is_empty()
+            && tables
+                .iter()
+                .all(|table| omnishards.contains_key(table.name));
+
+        self.all_omnisharded = Some(result);
+        result
+    }
+
+    /// Set the schema lookup context for INSERT without column list.
+    pub fn with_schema_lookup(mut self, ctx: SchemaLookupContext<'b>) -> Self {
+        self.schema_lookup = Some(ctx);
+        self
     }
 
     pub fn from_select(
@@ -222,6 +283,9 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
 
     /// Record a sharding key match.
     fn record_sharding_key(&mut self, shard: &Shard, column: Column<'_>, value: &Value<'_>) {
+        self.hooks
+            .record_sharding_key(shard, &column, value, &self.bind);
+
         if let Some(recorder) = self.recorder.as_mut() {
             let col_str = if let Some(table) = column.table {
                 format!("{}.{}", table, column.name)
@@ -254,6 +318,12 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
     }
 
     pub fn shard(&mut self) -> Result<Option<Shard>, Error> {
+        // Omnisharded config overrides sharded: if all tables are omnisharded,
+        // don't try to find a sharding key - let omnisharded routing handle it
+        if self.is_all_omnisharded() {
+            return Ok(None);
+        }
+
         let result = match self.stmt {
             Statement::Select(stmt) => self.shard_select(stmt),
             Statement::Update(stmt) => self.shard_update(stmt),
@@ -269,9 +339,10 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
         }
 
         // Fallback to schema-based sharding
-        let tables = self.extract_tables();
+        // Ensure tables are cached first
+        let _ = self.tables();
         let mut schema_sharder = SchemaSharder::default();
-        for table in &tables {
+        for table in self.cached_tables.as_ref().unwrap() {
             schema_sharder.resolve(table.schema(), &self.schema.schemas);
         }
 
@@ -281,6 +352,7 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
                     Some(shard.clone()),
                     format!("matched schema {}", schema_name),
                 );
+                self.hooks.record_sharded_schema(&shard, schema_name);
             }
             return Ok(Some(shard));
         }
@@ -288,8 +360,60 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
         Ok(None)
     }
 
+    /// Check that the query references a table that contains a sharded
+    /// column. This check is needed in case sharded tables config
+    /// doesn't specify a table name and should short-circuit if it does.
+    pub fn is_sharded(
+        &mut self,
+        db_schema: &Schema,
+        user: &str,
+        search_path: Option<&ParameterValue>,
+    ) -> bool {
+        // Omnisharded config overrides sharded: if all tables are omnisharded, return false
+        if self.is_all_omnisharded() {
+            return false;
+        }
+
+        let sharded_tables = self.schema.tables.tables();
+
+        // Separate configs with explicit table names from those without
+        let (named, nameless): (Vec<_>, Vec<_>) =
+            sharded_tables.iter().partition(|t| t.name.is_some());
+
+        for table in self.tables() {
+            // Check named sharded table configs (fast path, no schema lookup needed)
+            for config in &named {
+                if let Some(ref name) = config.name {
+                    if table.name == name {
+                        // Also check schema match if specified in config
+                        if let Some(ref config_schema) = config.schema {
+                            if table.schema != Some(config_schema.as_str()) {
+                                continue;
+                            }
+                        }
+                        return true;
+                    }
+                }
+            }
+
+            // Check nameless configs by looking up the table in the db schema
+            // to see if it has the sharding column
+            if !nameless.is_empty() {
+                if let Some(relation) = db_schema.table(*table, user, search_path) {
+                    for config in &nameless {
+                        if relation.has_column(&config.column) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     /// Extract all tables referenced in the statement.
-    fn extract_tables(&self) -> Vec<Table<'a>> {
+    pub fn extract_tables(&self) -> Vec<Table<'a>> {
         let mut tables = Vec::new();
         match self.stmt {
             Statement::Select(stmt) => self.extract_tables_from_select(stmt, &mut tables),
@@ -542,12 +666,58 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
         }
     }
 
+    /// Find sharded table config for a column.
+    /// Named configs (with explicit table names) match specific table+column.
+    /// Column-only configs match any table with that column name.
+    fn get_sharded_table(&self, column: Column<'a>) -> Option<&ShardedTable> {
+        self.get_sharded_table_by_name(column.name, column.table, column.schema)
+    }
+
+    /// Find sharded table config by column name (for INSERT without column list).
+    fn get_sharded_table_by_name(
+        &self,
+        column_name: &str,
+        table_name: Option<&str>,
+        schema: Option<&str>,
+    ) -> Option<&ShardedTable> {
+        // Try named table configs first
+        if let Some(table_name) = table_name {
+            let column = Column {
+                name: column_name,
+                table: Some(table_name),
+                schema,
+            };
+            if let Some(sharded_table) = self.schema.tables().get_table(column) {
+                if sharded_table.name.is_some() {
+                    return Some(sharded_table);
+                }
+            }
+        }
+
+        // Column-only config: user explicitly wants any table with this column to be sharded
+        self.schema
+            .tables
+            .tables()
+            .iter()
+            .find(|t| t.name.is_none() && t.column == column_name)
+    }
+
     fn compute_shard(
         &mut self,
         column: Column<'a>,
         value: Value<'a>,
     ) -> Result<Option<Shard>, Error> {
-        if let Some(table) = self.schema.tables().get_table(column) {
+        let sharded_table = self.get_sharded_table(column);
+        self.compute_shard_for_table(sharded_table, value)
+    }
+
+    /// Compute shard for a given sharded table config and value.
+    fn compute_shard_for_table(
+        &self,
+        sharded_table: Option<&ShardedTable>,
+        value: Value<'a>,
+    ) -> Result<Option<Shard>, Error> {
+        if let Some(table) = sharded_table {
             let context = ContextBuilder::new(table);
             let shard = match value {
                 Value::Placeholder(pos) => {
@@ -562,6 +732,10 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
                     } else {
                         return Ok(None);
                     };
+                    // NULL sharding key broadcasts to all shards
+                    if param.is_null() {
+                        return Ok(Some(Shard::All));
+                    }
                     let value = ShardingValue::from_param(&param, table.data_type)?;
                     Some(
                         context
@@ -587,7 +761,7 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
                         .build()?
                         .apply()?,
                 ),
-                Value::Null => None,
+                Value::Null => return Ok(Some(Shard::All)),
                 _ => None,
             };
 
@@ -703,7 +877,7 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
                             // parse array literals or parameters, so route to all shards.
                             if is_any
                                 && matches!(values, SearchResult::Value(_))
-                                && self.schema.tables().get_table(column).is_some()
+                                && self.get_sharded_table(column).is_some()
                             {
                                 return Ok(SearchResult::Match(Shard::All));
                             }
@@ -954,12 +1128,100 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
         Ok(SearchResult::None)
     }
 
+    /// Get column names from the INSERT statement, or look them up from schema if not specified.
+    fn get_insert_columns(&self, stmt: &InsertStmt, ctx: &SearchContext<'_>) -> Vec<String> {
+        // First try to get columns from the INSERT statement itself
+        let cols: Vec<String> = stmt
+            .cols
+            .iter()
+            .filter_map(|node| match &node.node {
+                Some(NodeEnum::ResTarget(target)) => Some(target.name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        if !cols.is_empty() {
+            return cols;
+        }
+
+        // No columns specified in INSERT, try to look them up from schema
+        if let (Some(table), Some(ref schema_lookup)) = (ctx.table, &self.schema_lookup) {
+            if let Some(relation) =
+                schema_lookup
+                    .db_schema
+                    .table(table, schema_lookup.user, schema_lookup.search_path)
+            {
+                return relation.column_names().map(String::from).collect();
+            }
+        }
+
+        vec![]
+    }
+
     /// Search an INSERT statement for sharding keys.
     fn search_insert_stmt(
         &mut self,
         stmt: &'a InsertStmt,
         ctx: &SearchContext<'a>,
     ) -> Result<SearchResult<'a>, Error> {
+        // Schema-based routing takes priority for INSERTs
+        if let Some(table) = ctx.table {
+            if let Some(schema) = self.schema.schemas.get(table.schema()) {
+                return Ok(SearchResult::Match(schema.shard().into()));
+            }
+        }
+
+        // Get the column names from INSERT INTO table (col1, col2, ...) or from schema
+        let columns = self.get_insert_columns(stmt, ctx);
+
+        // Handle different INSERT forms
+        if let Some(ref select_node) = stmt.select_stmt {
+            if let Some(NodeEnum::SelectStmt(ref select_stmt)) = select_node.node {
+                // Multi-row VALUES broadcasts to all shards
+                if select_stmt.values_lists.len() > 1 {
+                    return Ok(SearchResult::Match(Shard::All));
+                }
+
+                // INSERT...SELECT (no VALUES): try to extract sharding key from target list
+                if select_stmt.values_lists.is_empty() {
+                    // Try to extract constants from SELECT target list
+                    if !select_stmt.target_list.is_empty() {
+                        for (pos, target_node) in select_stmt.target_list.iter().enumerate() {
+                            if let Some(NodeEnum::ResTarget(ref target)) = target_node.node {
+                                if let Some(column_name) = columns.get(pos) {
+                                    let table_name = ctx.table.map(|t| t.name);
+                                    let table_schema = ctx.table.and_then(|t| t.schema);
+                                    let sharded_table = self.get_sharded_table_by_name(
+                                        column_name.as_str(),
+                                        table_name,
+                                        table_schema,
+                                    );
+
+                                    if sharded_table.is_some() {
+                                        if let Some(ref val) = target.val {
+                                            if let Ok(value) = Value::try_from(val.as_ref()) {
+                                                if let Some(shard) = self
+                                                    .compute_shard_for_table(sharded_table, value)?
+                                                {
+                                                    return Ok(SearchResult::Match(shard));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // INSERT...SELECT without extractable key broadcasts
+                    return Ok(SearchResult::Match(Shard::All));
+                }
+            }
+        } else {
+            // No select_stmt (DEFAULT VALUES) broadcasts to all shards
+            return Ok(SearchResult::Match(Shard::All));
+        }
+
         // Handle CTEs (WITH clause)
         if let Some(ref with_clause) = stmt.with_clause {
             for cte in &with_clause.ctes {
@@ -969,16 +1231,6 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
                 }
             }
         }
-
-        // Get the column names from INSERT INTO table (col1, col2, ...)
-        let columns: Vec<&str> = stmt
-            .cols
-            .iter()
-            .filter_map(|node| match &node.node {
-                Some(NodeEnum::ResTarget(target)) => Some(target.name.as_str()),
-                _ => None,
-            })
-            .collect();
 
         // The select_stmt field contains either VALUES or a SELECT subquery
         if let Some(ref select_node) = stmt.select_stmt {
@@ -991,17 +1243,19 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
                             for (pos, value_node) in list.items.iter().enumerate() {
                                 // Check if this position corresponds to a sharding key column
                                 if let Some(column_name) = columns.get(pos) {
-                                    let column = Column {
-                                        name: column_name,
-                                        table: ctx.table.map(|t| t.name),
-                                        schema: ctx.table.and_then(|t| t.schema),
-                                    };
+                                    let table_name = ctx.table.map(|t| t.name);
+                                    let table_schema = ctx.table.and_then(|t| t.schema);
+                                    let sharded_table = self.get_sharded_table_by_name(
+                                        column_name.as_str(),
+                                        table_name,
+                                        table_schema,
+                                    );
 
-                                    if self.schema.tables().get_table(column).is_some() {
+                                    if sharded_table.is_some() {
                                         // Try to extract the value directly
                                         if let Ok(value) = Value::try_from(value_node) {
                                             if let Some(shard) =
-                                                self.compute_shard_with_ctx(column, value, ctx)?
+                                                self.compute_shard_for_table(sharded_table, value)?
                                             {
                                                 return Ok(SearchResult::Match(shard));
                                             }
@@ -1018,12 +1272,17 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
                         }
                     }
                 }
+            }
+        }
 
-                // Handle INSERT ... SELECT by recursively searching the SelectStmt
-                let result = self.select_search(select_node, ctx)?;
-                if !result.is_none() {
-                    return Ok(result);
-                }
+        // Round-robin fallback: if table is sharded but no sharding key found,
+        // pick a shard at random
+        if let Some(table) = ctx.table {
+            let tables = Tables::new(self.schema);
+            if tables.sharded(table).is_some() {
+                return Ok(SearchResult::Match(Shard::Direct(
+                    round_robin::next() % self.schema.shards,
+                )));
             }
         }
 
@@ -1033,7 +1292,10 @@ impl<'a, 'b, 'c> StatementParser<'a, 'b, 'c> {
 
 #[cfg(test)]
 mod test {
-    use pgdog_config::{FlexibleType, Mapping, ShardedMapping, ShardedMappingKind, ShardedTable};
+    use pgdog_config::{
+        FlexibleType, Mapping, ShardedMapping, ShardedMappingKind, ShardedTable,
+        SystemCatalogsBehavior,
+    };
 
     use crate::backend::ShardedTables;
     use crate::net::messages::{Bind, Parameter};
@@ -1074,6 +1336,8 @@ mod test {
                     },
                 ],
                 vec![],
+                false,
+                SystemCatalogsBehavior::default(),
             ),
             ..Default::default()
         };
@@ -1788,9 +2052,82 @@ mod test {
     }
 
     #[test]
-    fn test_insert_no_sharding_key_returns_none() {
+    fn test_insert_no_sharding_key_uses_round_robin() {
+        // When sharding key is missing but table is sharded, use round-robin
         let result = run_test("INSERT INTO sharded (name) VALUES ('foo')", None);
+        assert!(matches!(result.unwrap(), Some(Shard::Direct(_))));
+    }
+
+    #[test]
+    fn test_insert_multi_row_broadcasts() {
+        // Multi-row INSERTs should broadcast to all shards
+        let result = run_test(
+            "INSERT INTO sharded (id, name) VALUES (1, 'foo'), (2, 'bar')",
+            None,
+        );
+        assert_eq!(result.unwrap(), Some(Shard::All));
+    }
+
+    #[test]
+    fn test_insert_multi_row_with_params_broadcasts() {
+        // Multi-row INSERTs with params should also broadcast
+        let bind = Bind::new_params(
+            "",
+            &[
+                Parameter::new(b"1"),
+                Parameter::new(b"foo"),
+                Parameter::new(b"2"),
+                Parameter::new(b"bar"),
+            ],
+        );
+        let result = run_test(
+            "INSERT INTO sharded (id, name) VALUES ($1, $2), ($3, $4)",
+            Some(&bind),
+        );
+        assert_eq!(result.unwrap(), Some(Shard::All));
+    }
+
+    #[test]
+    fn test_insert_unsharded_table_returns_none() {
+        // Unsharded table should return None (not round-robin)
+        let result = run_test("INSERT INTO unsharded_table (name) VALUES ('foo')", None);
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_insert_select_with_constant() {
+        // INSERT ... SELECT where the sharding key is a constant in the SELECT target list
+        let result = run_test("INSERT INTO sharded (id, name) SELECT 1, 'test'", None);
+        assert!(matches!(result.unwrap(), Some(Shard::Direct(_))));
+    }
+
+    #[test]
+    fn test_insert_select_with_constant_param() {
+        // INSERT ... SELECT where the sharding key is a parameter in the SELECT target list
+        let bind = Bind::new_params("", &[Parameter::new(b"1")]);
+        let result = run_test(
+            "INSERT INTO sharded (id, name) SELECT $1, 'test'",
+            Some(&bind),
+        );
+        assert!(matches!(result.unwrap(), Some(Shard::Direct(_))));
+    }
+
+    #[test]
+    fn test_insert_null_sharding_key_param_broadcasts() {
+        // NULL sharding key as param should broadcast to all shards
+        let bind = Bind::new_params("", &[Parameter::new_null(), Parameter::new(b"test")]);
+        let result = run_test(
+            "INSERT INTO sharded (id, name) VALUES ($1, $2)",
+            Some(&bind),
+        );
+        assert_eq!(result.unwrap(), Some(Shard::All));
+    }
+
+    #[test]
+    fn test_insert_null_sharding_key_literal_broadcasts() {
+        // NULL sharding key as literal should broadcast to all shards
+        let result = run_test("INSERT INTO sharded (id, name) VALUES (NULL, 'test')", None);
+        assert_eq!(result.unwrap(), Some(Shard::All));
     }
 
     // Schema-based sharding fallback tests
@@ -1807,6 +2144,8 @@ mod test {
                     ..Default::default()
                 }],
                 vec![],
+                false,
+                SystemCatalogsBehavior::default(),
             ),
             schemas: ShardedSchemas::new(vec![
                 ShardedSchema {
@@ -1921,5 +2260,388 @@ mod test {
         let result2 = run_test_with_schemas("SELECT * FROM inventory.items", None).unwrap();
         assert_eq!(result1, Some(Shard::Direct(1)));
         assert_eq!(result2, Some(Shard::Direct(2)));
+    }
+
+    // Column-only sharded table detection tests (using loaded schema)
+
+    fn run_test_column_only(stmt: &str, bind: Option<&Bind>) -> Result<Option<Shard>, Error> {
+        // Use column-only sharded table config (no table name)
+        let schema = ShardingSchema {
+            shards: 3,
+            tables: ShardedTables::new(
+                vec![ShardedTable {
+                    column: "tenant_id".into(),
+                    // No table name - column-only config
+                    ..Default::default()
+                }],
+                vec![],
+                false,
+                SystemCatalogsBehavior::default(),
+            ),
+            ..Default::default()
+        };
+        let raw = pg_query::parse(stmt)
+            .unwrap()
+            .protobuf
+            .stmts
+            .first()
+            .cloned()
+            .unwrap();
+        let mut parser = StatementParser::from_raw(&raw, bind, &schema, None)?;
+        parser.shard()
+    }
+
+    #[test]
+    fn test_column_only_select() {
+        let result = run_test_column_only("SELECT * FROM users WHERE tenant_id = 1", None).unwrap();
+        assert!(result.is_some(), "Should detect column-only sharding key");
+    }
+
+    #[test]
+    fn test_column_only_select_with_alias() {
+        let result =
+            run_test_column_only("SELECT * FROM users u WHERE u.tenant_id = 1", None).unwrap();
+        assert!(
+            result.is_some(),
+            "Should detect column-only sharding key with alias"
+        );
+    }
+
+    #[test]
+    fn test_column_only_select_bound_param() {
+        let bind = Bind::new_params("", &[Parameter::new(b"42")]);
+        let result =
+            run_test_column_only("SELECT * FROM users WHERE tenant_id = $1", Some(&bind)).unwrap();
+        assert!(
+            result.is_some(),
+            "Should detect column-only sharding key with bound param"
+        );
+    }
+
+    #[test]
+    fn test_column_only_update() {
+        let result =
+            run_test_column_only("UPDATE users SET name = 'foo' WHERE tenant_id = 1", None)
+                .unwrap();
+        assert!(
+            result.is_some(),
+            "Should detect column-only sharding key in UPDATE"
+        );
+    }
+
+    #[test]
+    fn test_column_only_delete() {
+        let result = run_test_column_only("DELETE FROM users WHERE tenant_id = 1", None).unwrap();
+        assert!(
+            result.is_some(),
+            "Should detect column-only sharding key in DELETE"
+        );
+    }
+
+    #[test]
+    fn test_column_only_insert() {
+        let result = run_test_column_only(
+            "INSERT INTO users (tenant_id, name) VALUES (1, 'foo')",
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.is_some(),
+            "Should detect column-only sharding key in INSERT"
+        );
+    }
+
+    #[test]
+    fn test_column_only_any_table() {
+        // Column-only configs work with any table
+        let result =
+            run_test_column_only("SELECT * FROM unknown_table WHERE tenant_id = 1", None).unwrap();
+        assert!(
+            result.is_some(),
+            "Column-only config should work with any table"
+        );
+    }
+
+    #[test]
+    fn test_column_only_wrong_column() {
+        // Column-only config shouldn't match different column name
+        let result = run_test_column_only("SELECT * FROM users WHERE other_id = 1", None).unwrap();
+        assert!(
+            result.is_none(),
+            "Column-only config should not match different column, got {:?}",
+            result
+        );
+    }
+
+    // INSERT without column list tests
+    use crate::backend::schema::columns::StatsColumn as SchemaColumn;
+    use crate::backend::schema::Relation;
+    use indexmap::IndexMap;
+
+    fn make_test_schema_with_relation() -> crate::backend::Schema {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "id".to_string(),
+            SchemaColumn {
+                table_catalog: "test".into(),
+                table_schema: "public".into(),
+                table_name: "sharded".into(),
+                column_name: "id".into(),
+                column_default: String::new(),
+                is_nullable: false,
+                data_type: "bigint".into(),
+                ordinal_position: 1,
+                is_primary_key: true,
+                foreign_keys: Vec::new(),
+            }
+            .into(),
+        );
+        columns.insert(
+            "name".to_string(),
+            SchemaColumn {
+                table_catalog: "test".into(),
+                table_schema: "public".into(),
+                table_name: "sharded".into(),
+                column_name: "name".into(),
+                column_default: String::new(),
+                is_nullable: true,
+                data_type: "text".into(),
+                ordinal_position: 2,
+                is_primary_key: false,
+                foreign_keys: Vec::new(),
+            }
+            .into(),
+        );
+        let relation = Relation::test_table("public", "sharded", columns);
+        let relations = HashMap::from([(("public".into(), "sharded".into()), relation)]);
+        crate::backend::Schema::from_parts(vec!["public".into()], relations)
+    }
+
+    fn run_test_with_schema_lookup(
+        stmt: &str,
+        bind: Option<&Bind>,
+    ) -> Result<Option<Shard>, Error> {
+        let sharding_schema = ShardingSchema {
+            shards: 3,
+            tables: ShardedTables::new(
+                vec![ShardedTable {
+                    column: "id".into(),
+                    name: Some("sharded".into()),
+                    ..Default::default()
+                }],
+                vec![],
+                false,
+                SystemCatalogsBehavior::default(),
+            ),
+            ..Default::default()
+        };
+        let db_schema = make_test_schema_with_relation();
+        let schema_lookup = SchemaLookupContext {
+            db_schema: &db_schema,
+            user: "test",
+            search_path: None,
+        };
+        let raw = pg_query::parse(stmt)
+            .unwrap()
+            .protobuf
+            .stmts
+            .first()
+            .cloned()
+            .unwrap();
+        let mut parser = StatementParser::from_raw(&raw, bind, &sharding_schema, None)?
+            .with_schema_lookup(schema_lookup);
+        parser.shard()
+    }
+
+    #[test]
+    fn test_insert_without_column_list() {
+        // INSERT INTO sharded VALUES (1, 'test') should find sharding key from schema
+        let result = run_test_with_schema_lookup("INSERT INTO sharded VALUES (1, 'test')", None);
+        assert!(
+            result.as_ref().unwrap().is_some(),
+            "Should detect sharding key in INSERT without column list, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_insert_without_column_list_bound_param() {
+        // INSERT INTO sharded VALUES ($1, $2) with bound params
+        let bind = Bind::new_params("", &[Parameter::new(b"1"), Parameter::new(b"test")]);
+        let result =
+            run_test_with_schema_lookup("INSERT INTO sharded VALUES ($1, $2)", Some(&bind));
+        assert!(
+            result.as_ref().unwrap().is_some(),
+            "Should detect sharding key in INSERT without column list (bound param), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_insert_without_column_list_null_key() {
+        // INSERT INTO sharded VALUES (NULL, 'test') should broadcast
+        let result = run_test_with_schema_lookup("INSERT INTO sharded VALUES (NULL, 'test')", None);
+        assert_eq!(
+            result.unwrap(),
+            Some(Shard::All),
+            "NULL sharding key should broadcast"
+        );
+    }
+
+    // Omnisharded override tests
+    use pgdog_config::OmnishardedTable;
+
+    fn make_omnisharded_sharding_schema() -> ShardingSchema {
+        // Column-only sharded table config (no table name specified)
+        // This would normally match any table with a "tenant_id" column
+        ShardingSchema {
+            shards: 3,
+            tables: ShardedTables::new(
+                vec![ShardedTable {
+                    column: "tenant_id".into(),
+                    // No table name - column-only config
+                    ..Default::default()
+                }],
+                vec![
+                    OmnishardedTable {
+                        name: "users".into(),
+                        sticky_routing: false,
+                    },
+                    OmnishardedTable {
+                        name: "sessions".into(),
+                        sticky_routing: false,
+                    },
+                ],
+                false,
+                SystemCatalogsBehavior::default(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn make_omnisharded_db_schema() -> Schema {
+        // Create a db_schema with tables that have the tenant_id column
+        // This ensures that column-only sharding config would match these tables
+        let mut relations = HashMap::new();
+
+        // Helper to create a table with id and tenant_id columns
+        let make_table = |table_name: &str| {
+            let mut columns = IndexMap::new();
+            columns.insert(
+                "id".to_string(),
+                SchemaColumn {
+                    table_name: table_name.into(),
+                    column_name: "id".into(),
+                    ordinal_position: 1,
+                    is_primary_key: true,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            columns.insert(
+                "tenant_id".to_string(),
+                SchemaColumn {
+                    table_name: table_name.into(),
+                    column_name: "tenant_id".into(),
+                    ordinal_position: 2,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            Relation::test_table("public", table_name, columns)
+        };
+
+        // "users" table (omnisharded)
+        relations.insert(("public".into(), "users".into()), make_table("users"));
+
+        // "sessions" table (omnisharded)
+        relations.insert(("public".into(), "sessions".into()), make_table("sessions"));
+
+        // "orders" table (NOT omnisharded)
+        relations.insert(("public".into(), "orders".into()), make_table("orders"));
+
+        Schema::from_parts(vec!["public".into()], relations)
+    }
+
+    fn run_is_sharded_test(stmt: &str) -> bool {
+        let schema = make_omnisharded_sharding_schema();
+        let db_schema = make_omnisharded_db_schema();
+        let raw = pg_query::parse(stmt)
+            .unwrap()
+            .protobuf
+            .stmts
+            .first()
+            .cloned()
+            .unwrap();
+        let mut parser = StatementParser::from_raw(&raw, None, &schema, None).unwrap();
+        parser.is_sharded(&db_schema, "test", None)
+    }
+
+    #[test]
+    fn test_omnisharded_overrides_column_only_sharding() {
+        // Table "users" is in omnisharded config and has tenant_id column
+        // Even though column-only config would match, omnisharded should override
+        let result = run_is_sharded_test("SELECT * FROM users WHERE tenant_id = 1");
+        assert!(
+            !result,
+            "Omnisharded table should override column-only sharding config"
+        );
+    }
+
+    #[test]
+    fn test_omnisharded_overrides_for_multiple_omnisharded_tables() {
+        // Both tables are in omnisharded config
+        let result =
+            run_is_sharded_test("SELECT * FROM users u JOIN sessions s ON u.id = s.user_id");
+        assert!(
+            !result,
+            "Query with all omnisharded tables should return false"
+        );
+    }
+
+    #[test]
+    fn test_mixed_omnisharded_and_regular_table_is_sharded() {
+        // "users" is omnisharded, but "orders" is not
+        // Since not all tables are omnisharded, should check sharding config
+        let result = run_is_sharded_test("SELECT * FROM users u JOIN orders o ON u.id = o.user_id");
+        assert!(
+            result,
+            "Query with mixed omnisharded and regular tables should be sharded"
+        );
+    }
+
+    #[test]
+    fn test_non_omnisharded_table_is_sharded() {
+        // Table "orders" is not in omnisharded config and has tenant_id column
+        // Should match the column-only sharding config
+        let result = run_is_sharded_test("SELECT * FROM orders WHERE tenant_id = 1");
+        assert!(
+            result,
+            "Non-omnisharded table with sharding column should be sharded"
+        );
+    }
+
+    #[test]
+    fn test_omnisharded_insert_not_sharded() {
+        let result = run_is_sharded_test("INSERT INTO users (tenant_id, name) VALUES (1, 'test')");
+        assert!(
+            !result,
+            "INSERT into omnisharded table should not be sharded"
+        );
+    }
+
+    #[test]
+    fn test_omnisharded_update_not_sharded() {
+        let result = run_is_sharded_test("UPDATE users SET name = 'test' WHERE tenant_id = 1");
+        assert!(!result, "UPDATE on omnisharded table should not be sharded");
+    }
+
+    #[test]
+    fn test_omnisharded_delete_not_sharded() {
+        let result = run_is_sharded_test("DELETE FROM users WHERE tenant_id = 1");
+        assert!(
+            !result,
+            "DELETE from omnisharded table should not be sharded"
+        );
     }
 }

@@ -127,7 +127,7 @@ async fn test_notify_only_delivered_after_transaction_commit() {
     // Wait for the NOTIFY to be delivered after commit
     let result = timeout(Duration::from_secs(5), async {
         loop {
-            if messages.lock().len() > 0 {
+            if !messages.lock().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -377,4 +377,14 @@ async fn test_notify_not_delivered_after_constraint_violation() {
     // Clean up
     let _ = conn.execute("DROP TABLE test_notify_constraint").await;
     listener_task.abort();
+}
+
+#[tokio::test]
+async fn test_listen_session_mode() {
+    let mut conn = PgConnection::connect("postgres://pgdog_session:pgdog@127.0.0.1:6432/pgdog")
+        .await
+        .unwrap();
+
+    conn.execute("LISTEN test_session_channel").await.unwrap();
+    conn.execute("UNLISTEN test_session_channel").await.unwrap();
 }

@@ -96,7 +96,7 @@ impl Guard {
             } else {
                 debug!(
                     "[cleanup] no cleanup needed, server in \"{}\" state [{}]",
-                    server.stats().state,
+                    server.stats().get_state(),
                     server.addr(),
                 );
                 if let Err(err) = pool.checkin(server) {
@@ -116,11 +116,11 @@ impl Guard {
         let needs_drain = server.needs_drain();
 
         if needs_drain {
-            if conn_recovery.can_recover() {
+            if conn_recovery.can_recover() && !server.sending_request() {
                 // Receive whatever data the client left before disconnecting.
                 debug!(
                     "[cleanup] draining data from \"{}\" server [{}]",
-                    server.stats().state,
+                    server.stats().get_state(),
                     server.addr()
                 );
                 server.drain().await?;
@@ -138,7 +138,7 @@ impl Guard {
             if conn_recovery.can_rollback() {
                 debug!(
                     "[cleanup] rolling back server transaction, in \"{}\" state [{}]",
-                    server.stats().state,
+                    server.stats().get_state(),
                     server.addr(),
                 );
                 server.rollback().await?;
@@ -152,7 +152,7 @@ impl Guard {
             debug!(
                 "[cleanup] running {} cleanup queries, server in \"{}\" state [{}]",
                 cleanup.len(),
-                server.stats().state,
+                server.stats().get_state(),
                 server.addr()
             );
             server.execute_batch(cleanup.queries()).await?;
@@ -180,7 +180,7 @@ impl Guard {
         if sync_prepared {
             debug!(
                 "[cleanup] syncing prepared statements, server in \"{}\" state [{}]",
-                server.stats().state,
+                server.stats().get_state(),
                 server.addr()
             );
             server.sync_prepared_statements().await?;
@@ -314,10 +314,12 @@ mod test {
         crate::logger();
 
         let config = Config {
-            max: 1,
-            min: 0,
-            rollback_timeout: Duration::from_millis(100),
-            ..Default::default()
+            inner: pgdog_stats::Config {
+                max: 1,
+                min: 0,
+                rollback_timeout: Duration::from_millis(100),
+                ..Config::default().inner
+            },
         };
 
         let pool = Pool::new(&PoolConfig {
@@ -406,7 +408,7 @@ mod test {
     #[tokio::test]
     async fn test_cancel_safety_partial_send() {
         let mut server = test_server().await;
-        let select = (0..50_000_000).into_iter().map(|_| 'b').collect::<String>();
+        let select = (0..50_000_000).map(|_| 'b').collect::<String>();
         let select = Query::new(format!("SELECT '{}'", select));
         let res = timeout(
             Duration::from_millis(1),
@@ -508,7 +510,7 @@ mod test {
             .unwrap();
 
         use crate::state::State;
-        assert_eq!(server.stats().state, State::ForceClose);
+        assert_eq!(server.stats().get_state(), State::ForceClose);
         assert!(server.needs_drain());
     }
 
@@ -554,7 +556,7 @@ mod test {
             .unwrap();
 
         use crate::state::State;
-        assert_eq!(server.stats().state, State::ForceClose);
+        assert_eq!(server.stats().get_state(), State::ForceClose);
         assert!(server.needs_drain());
     }
 
@@ -667,7 +669,7 @@ mod test {
             .unwrap();
 
         use crate::state::State;
-        assert_eq!(server.stats().state, State::ForceClose);
+        assert_eq!(server.stats().get_state(), State::ForceClose);
         assert!(server.in_transaction());
     }
 
@@ -728,7 +730,7 @@ mod test {
             .unwrap();
 
         use crate::state::State;
-        assert_eq!(server.stats().state, State::ForceClose);
+        assert_eq!(server.stats().get_state(), State::ForceClose);
         assert!(server.needs_drain());
         assert!(server.in_transaction());
     }
@@ -780,5 +782,72 @@ mod test {
 
         let one: Vec<i32> = server.fetch_all("SELECT 1").await.unwrap();
         assert_eq!(one[0], 1);
+    }
+
+    #[tokio::test]
+    async fn test_sending_request_false_initially() {
+        crate::logger();
+
+        let server = test_server().await;
+
+        assert!(
+            !server.sending_request(),
+            "sending_request should be false initially"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sending_request_false_after_successful_send() {
+        crate::logger();
+
+        let mut server = test_server().await;
+
+        server
+            .send(&vec![Query::new("SELECT 1").into()].into())
+            .await
+            .unwrap();
+
+        assert!(
+            !server.sending_request(),
+            "sending_request should be false after successful send"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_send_force_closes_on_checkin() {
+        crate::logger();
+
+        let pool = pool();
+
+        {
+            let mut guard = timeout(Duration::from_secs(5), pool.get(&Request::default()))
+                .await
+                .expect("timed out getting connection")
+                .unwrap();
+
+            // Send a very large query that will timeout during send
+            let large_query = (0..50_000_000).map(|_| 'b').collect::<String>();
+            let large_query = Query::new(format!("SELECT '{}'", large_query));
+
+            let res = timeout(
+                Duration::from_millis(1),
+                guard.send(&vec![large_query.into()].into()),
+            )
+            .await;
+
+            assert!(res.is_err(), "send should timeout");
+            assert!(
+                guard.sending_request(),
+                "sending_request should be true after interrupted send"
+            );
+        }
+
+        sleep(Duration::from_millis(100)).await;
+
+        let state = pool.state();
+        assert_eq!(
+            state.force_close, 1,
+            "force_close should be incremented when connection has interrupted send"
+        );
     }
 }

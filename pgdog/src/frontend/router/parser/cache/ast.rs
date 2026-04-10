@@ -1,6 +1,7 @@
 use pg_query::{parse, parse_raw, protobuf::ObjectType, NodeEnum, NodeRef, ParseResult};
 use pgdog_config::QueryParserEngine;
 use std::fmt::Debug;
+use std::time::Instant;
 use std::{collections::HashSet, ops::Deref};
 
 use parking_lot::Mutex;
@@ -10,8 +11,10 @@ use super::super::{
     comment::comment, Error, Route, Shard, StatementRewrite, StatementRewriteContext, Table,
 };
 use super::{Fingerprint, Stats};
+use crate::backend::schema::Schema;
 use crate::frontend::router::parser::rewrite::statement::RewritePlan;
 use crate::frontend::{BufferedQuery, PreparedStatements};
+use crate::net::parameter::ParameterValue;
 use crate::{backend::ShardingSchema, config::Role};
 
 /// Abstract syntax tree (query) cache entry,
@@ -67,8 +70,12 @@ impl Ast {
     pub fn new(
         query: &BufferedQuery,
         schema: &ShardingSchema,
+        db_schema: &Schema,
         prepared_statements: &mut PreparedStatements,
+        user: &str,
+        search_path: Option<&ParameterValue>,
     ) -> Result<Self, Error> {
+        let now = Instant::now();
         let mut ast = match schema.query_parser_engine {
             QueryParserEngine::PgQueryProtobuf => parse(query),
             QueryParserEngine::PgQueryRaw => parse_raw(query),
@@ -87,16 +94,23 @@ impl Ast {
                 prepared: query.prepared(),
                 prepared_statements,
                 schema,
+                db_schema,
+                user,
+                search_path,
             })
             .maybe_rewrite()?
         } else {
             RewritePlan::default()
         };
 
+        let elapsed = now.elapsed();
+        let mut stats = Stats::new();
+        stats.parse_time += elapsed;
+
         Ok(Self {
             cached: true,
             inner: Arc::new(AstInner {
-                stats: Mutex::new(Stats::new()),
+                stats: Mutex::new(stats),
                 comment_shard,
                 comment_role,
                 ast,
@@ -104,6 +118,22 @@ impl Ast {
                 fingerprint,
             }),
         })
+    }
+
+    /// Parse statement using AstContext for schema and user information.
+    pub fn with_context(
+        query: &BufferedQuery,
+        ctx: &super::AstContext<'_>,
+        prepared_statements: &mut PreparedStatements,
+    ) -> Result<Self, Error> {
+        Self::new(
+            query,
+            &ctx.sharding_schema,
+            &ctx.db_schema,
+            prepared_statements,
+            ctx.user,
+            ctx.search_path,
+        )
     }
 
     /// Record new AST entry, without rewriting or comment-routing.
@@ -184,4 +214,42 @@ impl Ast {
             guard.direct += 1;
         }
     }
+
+    /// Get statement type.
+    pub fn statement_type(&self) -> StatementType {
+        let root = self
+            .ast
+            .protobuf
+            .stmts
+            .first()
+            .and_then(|s| s.stmt.as_ref())
+            .and_then(|s| s.node.as_ref());
+
+        match root {
+            Some(NodeEnum::SelectStmt(_))
+            | Some(NodeEnum::InsertStmt(_))
+            | Some(NodeEnum::UpdateStmt(_))
+            | Some(NodeEnum::DeleteStmt(_))
+            | Some(NodeEnum::CopyStmt(_))
+            | Some(NodeEnum::ExplainStmt(_))
+            | Some(NodeEnum::TransactionStmt(_)) => StatementType::Dml,
+
+            Some(NodeEnum::VariableSetStmt(_))
+            | Some(NodeEnum::VariableShowStmt(_))
+            | Some(NodeEnum::DeallocateStmt(_))
+            | Some(NodeEnum::ListenStmt(_))
+            | Some(NodeEnum::NotifyStmt(_))
+            | Some(NodeEnum::UnlistenStmt(_))
+            | Some(NodeEnum::DiscardStmt(_)) => StatementType::Session,
+
+            _ => StatementType::Ddl,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StatementType {
+    Ddl,
+    Dml,
+    Session,
 }

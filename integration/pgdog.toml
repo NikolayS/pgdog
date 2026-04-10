@@ -2,9 +2,9 @@
 # ----- General ----------------------------------------------------------------
 
 [general]
-query_timeout = 1_000
-checkout_timeout = 1_000
-connect_timeout = 1_000
+query_timeout = 2_000
+checkout_timeout = 2_000
+connect_timeout = 2_000
 load_balancing_strategy = "round_robin"
 rollback_timeout = 1_000
 read_write_strategy = "aggressive"
@@ -21,6 +21,11 @@ healthcheck_port = 8080
 tls_certificate = "integration/tls/cert.pem"
 tls_private_key = "integration/tls/key.pem"
 query_parser_engine = "pg_query_raw"
+system_catalogs = "omnisharded_sticky"
+reload_schema_on_ddl = false
+#idle_healthcheck_delay = 50000000
+unique_id_function = "standard"
+auth_type = "scram"
 
 [memory]
 net_buffer = 8096
@@ -30,6 +35,7 @@ message_buffer = 8096
 enabled = false
 shard_key = "ignore"
 split_inserts = "error"
+# primary_key = "rewrite"
 
 # ------------------------------------------------------------------------------
 # ----- Database :: pgdog ------------------------------------------------------
@@ -72,6 +78,19 @@ host = "localhost"
 database_name = "shard_1"
 shard = 1
 role = "replica"
+
+# [[databases]]
+# name = "pgdog_sharded"
+# host = "localhost"
+# database_name = "shard_2"
+# shard = 2
+
+# [[databases]]
+# name = "pgdog_sharded"
+# host = "localhost"
+# database_name = "shard_2"
+# shard = 2
+# role = "replica"
 
 # ------------------------------------------------------------------------------
 # ----- Database :: failover ---------------------------------------------------
@@ -400,6 +419,28 @@ shard = 1
 database = "pgdog_schema"
 shard = 0
 
+[[databases]]
+name = "pgdog_schema_no_cross"
+host = "127.0.0.1"
+database_name = "shard_0"
+shard = 0
+
+[[databases]]
+name = "pgdog_schema_no_cross"
+host = "127.0.0.1"
+database_name = "shard_1"
+shard = 1
+
+
+[[sharded_schemas]]
+database = "pgdog_schema_no_cross"
+name = "shard_0"
+shard = 0
+
+[[sharded_schemas]]
+database = "pgdog_schema_no_cross"
+name = "shard_1"
+shard = 1
 
 # ------------------------------------------------------------------------------
 # ----- Admin ------------------------------------------------------------------

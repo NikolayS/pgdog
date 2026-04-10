@@ -1,6 +1,6 @@
 [package]
 name = "pgdog"
-version = "0.1.22"
+version = "0.1.36"
 edition = "2021"
 description = "Modern PostgreSQL proxy, pooler and load balancer."
 authors = ["PgDog <hi@pgdog.dev>"]
@@ -20,7 +20,7 @@ tui = ["ratatui"]
 pin-project = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "std"] }
 parking_lot = "0.12"
 thiserror = "2"
 bytes = "1"
@@ -35,16 +35,17 @@ rustls-native-certs = "0.8"
 rustls-pki-types = "1"
 arc-swap = "1"
 toml = "0.8"
-pgdog-plugin = { path = "../pgdog-plugin", version = "0.1.8" }
+pgdog-plugin.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 fnv = "1"
-scram = { git = "https://github.com/pgdogdev/scram.git", rev = "848003d" }
+scram = { git = "https://github.com/pgdogdev/scram.git", rev = "66f34fd60d393405c75ff6f416e67142b5d15223" }
 base64 = "0.22"
 md5 = "0.7"
 futures = "0.3"
 csv-core = "0.1"
-pg_query = { git = "https://github.com/pgdogdev/pg_query.rs.git", rev = "4f79b92fe4d630b1f253f27f13c9096c77530fd6" }
+pg_query = { git = "https://github.com/pgdogdev/pg_query.rs.git", rev = "d30dcb47fdf3fa77d102b813a34392146642903a" }
 regex = "1"
+semver = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 ratatui = { version = "0.30.0-alpha.1", optional = true }
@@ -56,14 +57,18 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["full"] }
 socket2 = "0.5.9"
 sha1 = "0.10"
-indexmap = "2.9"
+indexmap = { version = "2.9", features = ["serde"] }
 lru = "0.16"
 hickory-resolver = "0.25.2"
 lazy_static = "1"
 dashmap = "6"
 derive_builder = "0.20.2"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-rds = "1"
 pgdog-config = { path = "../pgdog-config" }
 pgdog-vector = { path = "../pgdog-vector" }
+pgdog-stats = { path = "../pgdog-stats" }
+pgdog-postgres-types = { path = "../pgdog-postgres-types"}
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

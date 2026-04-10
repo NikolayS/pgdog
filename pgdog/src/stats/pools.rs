@@ -1,4 +1,5 @@
 use crate::backend::{self, databases::databases};
+use crate::util::millis;
 
 use super::{Measurement, Metric, OpenMetric};
 
@@ -43,6 +44,7 @@ pub struct Pools {
 impl Pools {
     pub fn load() -> Pools {
         let mut metrics = vec![];
+        let mut max_connections = vec![];
         let mut cl_waiting = vec![];
         let mut sv_active = vec![];
         let mut sv_idle = vec![];
@@ -77,7 +79,13 @@ impl Pools {
         let mut avg_connect_time = vec![];
         let mut total_connect_count = vec![];
         let mut avg_connect_count = vec![];
+        let mut total_reads = vec![];
+        let mut avg_reads = vec![];
+        let mut total_writes = vec![];
+        let mut avg_writes = vec![];
         let mut total_sv_xact_idle = vec![];
+
+        let general = &crate::config::config().config.general;
 
         for (user, cluster) in databases().all() {
             for (shard_num, shard) in cluster.shards().iter().enumerate() {
@@ -91,6 +99,11 @@ impl Pools {
                         ("shard".into(), shard_num.to_string()),
                         ("role".into(), role.to_string()),
                     ];
+
+                    max_connections.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: state.config.max.into(),
+                    });
 
                     cl_waiting.push(Measurement {
                         labels: labels.clone(),
@@ -178,32 +191,32 @@ impl Pools {
 
                     total_xact_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: totals.xact_time.as_millis().into(),
+                        measurement: millis(totals.xact_time).into(),
                     });
 
                     avg_xact_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: averages.xact_time.as_millis().into(),
+                        measurement: millis(averages.xact_time).into(),
                     });
 
                     total_idle_xact_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: totals.idle_xact_time.as_millis().into(),
+                        measurement: millis(totals.idle_xact_time).into(),
                     });
 
                     avg_idle_xact_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: averages.idle_xact_time.as_millis().into(),
+                        measurement: millis(averages.idle_xact_time).into(),
                     });
 
                     total_query_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: totals.query_time.as_millis().into(),
+                        measurement: millis(totals.query_time).into(),
                     });
 
                     avg_query_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: averages.query_time.as_millis().into(),
+                        measurement: millis(averages.query_time).into(),
                     });
 
                     total_close.push(Measurement {
@@ -248,12 +261,12 @@ impl Pools {
 
                     total_connect_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: totals.connect_time.as_millis().into(),
+                        measurement: millis(totals.connect_time).into(),
                     });
 
                     avg_connect_time.push(Measurement {
                         labels: labels.clone(),
-                        measurement: averages.connect_time.as_millis().into(),
+                        measurement: millis(averages.connect_time).into(),
                     });
 
                     total_connect_count.push(Measurement {
@@ -266,6 +279,26 @@ impl Pools {
                         measurement: averages.connect_count.into(),
                     });
 
+                    total_reads.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.reads.into(),
+                    });
+
+                    avg_reads.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.reads.into(),
+                    });
+
+                    total_writes.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: totals.writes.into(),
+                    });
+
+                    avg_writes.push(Measurement {
+                        labels: labels.clone(),
+                        measurement: averages.writes.into(),
+                    });
+
                     total_sv_xact_idle.push(Measurement {
                         labels: labels.clone(),
                         measurement: backend::stats::idle_in_transaction(&pool).into(),
@@ -273,6 +306,36 @@ impl Pools {
                 }
             }
         }
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "max_connections".into(),
+            measurements: max_connections,
+            help: "Maximum number of allowed server connections".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "prepared_statements_limit".into(),
+            measurements: vec![Measurement {
+                labels: vec![],
+                measurement: general.prepared_statements_limit.into(),
+            }],
+            help: "Maximum number of prepared statements that can be cached".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "query_cache_limit".into(),
+            measurements: vec![Measurement {
+                labels: vec![],
+                measurement: general.query_cache_limit.into(),
+            }],
+            help: "Maximum number of queries that can be stored in the cache".into(),
+            unit: None,
+            metric_type: None,
+        }));
 
         metrics.push(Metric::new(PoolMetric {
             name: "cl_waiting".into(),
@@ -549,6 +612,38 @@ impl Pools {
             name: "avg_connect_count".into(),
             measurements: avg_connect_count,
             help: "Average number of connections established to servers.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_reads".into(),
+            measurements: total_reads,
+            help: "Total number of read transactions.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_reads".into(),
+            measurements: avg_reads,
+            help: "Average number of read transactions per statistics period.".into(),
+            unit: None,
+            metric_type: None,
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "total_writes".into(),
+            measurements: total_writes,
+            help: "Total number of write transactions.".into(),
+            unit: None,
+            metric_type: Some("counter".into()),
+        }));
+
+        metrics.push(Metric::new(PoolMetric {
+            name: "avg_writes".into(),
+            measurements: avg_writes,
+            help: "Average number of write transactions per statistics period.".into(),
             unit: None,
             metric_type: None,
         }));

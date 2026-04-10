@@ -1,26 +1,29 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::read_to_string;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::sharding::ShardedSchema;
+use crate::util::random_string;
 use crate::{
-    EnumeratedDatabase, Memory, OmnishardedTable, PassthoughAuth, PreparedStatements,
-    QueryParserEngine, QueryParserLevel, ReadWriteSplit, RewriteMode, Role,
+    system_catalogs, EnumeratedDatabase, Memory, OmnishardedTable, PassthroughAuth,
+    PreparedStatements, QueryParserEngine, QueryParserLevel, ReadWriteSplit, RewriteMode, Role,
+    SystemCatalogsBehavior,
 };
 
 use super::database::Database;
 use super::error::Error;
 use super::general::General;
-use super::networking::{MultiTenant, Tcp};
-use super::pooling::{PoolerMode, Stats};
-use super::replication::{MirrorConfig, Mirroring, ReplicaLag, Replication};
+use super::networking::{MultiTenant, Tcp, TlsVerifyMode};
+use super::pooling::PoolerMode;
+use super::replication::{MirrorConfig, Mirroring, MirroringLevel, ReplicaLag, Replication};
 use super::rewrite::Rewrite;
 use super::sharding::{ManualQuery, OmnishardedTables, ShardedMapping, ShardedTable};
-use super::users::{Admin, Plugin, Users};
+use super::users::{Admin, Plugin, ServerAuth, Users};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConfigAndUsers {
     /// pgdog.toml
     pub config: Config,
@@ -38,7 +41,11 @@ impl ConfigAndUsers {
         let mut config: Config = if let Ok(config) = read_to_string(config_path) {
             let config = match toml::from_str(&config) {
                 Ok(config) => config,
-                Err(err) => return Err(Error::config(&config, err)),
+                Err(err) => {
+                    let error = Error::config(&config, err);
+                    error!("failed to load {}: {}", config_path.display(), error);
+                    return Err(error);
+                }
             };
             info!("loaded \"{}\"", config_path.display());
             config
@@ -55,7 +62,14 @@ impl ConfigAndUsers {
         }
 
         let mut users: Users = if let Ok(users) = read_to_string(users_path) {
-            let mut users: Users = toml::from_str(&users)?;
+            let mut users: Users = match toml::from_str(&users) {
+                Ok(config) => config,
+                Err(err) => {
+                    let error = Error::config(&users, err);
+                    error!("failed to load {}: {}", users_path.display(), error);
+                    return Err(error);
+                }
+            };
             users.check(&config);
             info!("loaded \"{}\"", users_path.display());
             users
@@ -80,12 +94,47 @@ impl ConfigAndUsers {
             warn!("admin password has been randomly generated");
         }
 
-        Ok(ConfigAndUsers {
+        let config_and_users = ConfigAndUsers {
             config,
             users,
             config_path: config_path.to_owned(),
             users_path: users_path.to_owned(),
-        })
+        };
+
+        Ok(config_and_users)
+    }
+
+    pub fn check(&mut self) -> Result<(), Error> {
+        self.config.check();
+        self.users.check(&self.config);
+        self.validate_server_auth()?;
+        Ok(())
+    }
+
+    fn validate_server_auth(&self) -> Result<(), Error> {
+        let has_rds_iam_user = self
+            .users
+            .users
+            .iter()
+            .any(|user| user.server_auth == ServerAuth::RdsIam);
+
+        if !has_rds_iam_user {
+            return Ok(());
+        }
+
+        if self.config.general.passthrough_auth != PassthroughAuth::Disabled {
+            return Err(Error::ParseError(
+                "\"passthrough_auth\" must be \"disabled\" when any user has \"server_auth = \\\"rds_iam\\\"\"".into(),
+            ));
+        }
+
+        if self.config.general.tls_verify == TlsVerifyMode::Disabled {
+            return Err(Error::ParseError(
+                "\"tls_verify\" cannot be \"disabled\" when any user has \"server_auth = \\\"rds_iam\\\"\"".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Prepared statements are enabled.
@@ -124,39 +173,58 @@ impl Default for ConfigAndUsers {
 }
 
 /// Configuration.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// General configuration.
+    /// General settings are relevant to the operations of the pooler itself, or apply to all database pools.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/general/
     #[serde(default)]
     pub general: General,
 
-    /// Rewrite configuration.
+    /// Controls PgDog's automatic SQL rewrites for sharded databases. It affects sharding key updates and multi-tuple inserts.
+    ///
+    /// **Note:** Consider enabling two-phase commit when either feature is set to `rewrite`. Without it, rewrites are committed shard-by-shard and can leave partial changes if a transaction fails.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/rewrite/
     #[serde(default)]
     pub rewrite: Rewrite,
 
-    /// Statistics.
-    #[serde(default)]
-    pub stats: Stats,
-
-    /// TCP settings
+    /// PgDog speaks the Postgres protocol which, underneath, uses TCP. Optimal TCP settings are necessary to quickly recover from database incidents.
+    ///
+    /// **Note:** Not all networks support or play well with TCP keep-alives. If you see an increased number of dropped connections after enabling these settings, you may have to disable them.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/network/
     #[serde(default)]
     pub tcp: Tcp,
 
-    /// Multi-tenant
+    /// Multi-tenant isolation settings.
     pub multi_tenant: Option<MultiTenant>,
 
-    /// Servers.
+    /// Database settings configure which databases PgDog is managing. This is a TOML list of hosts, ports, and other settings like database roles (primary or replica).
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/databases/
     #[serde(default)]
     pub databases: Vec<Database>,
 
+    /// [Plugins](https://docs.pgdog.dev/features/plugins/) are dynamically loaded at PgDog startup. These settings control which plugins are loaded.
+    ///
+    /// **Note:** Plugins can only be configured at PgDog startup. They cannot be changed after the process is running.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/plugins/
     #[serde(default)]
     pub plugins: Vec<Plugin>,
 
+    /// Admin database settings control access to the [admin](https://docs.pgdog.dev/administration/) database which contains real time statistics about internal operations of PgDog.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/admin/
     #[serde(default)]
+    #[schemars(default = "crate::users::Admin::schemars_default_stub")]
     pub admin: Admin,
 
-    /// List of sharded tables.
+    /// To detect and route queries with sharding keys, PgDog expects the sharded column to be specified in the configuration.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/
     #[serde(default)]
     pub sharded_tables: Vec<ShardedTable>,
 
@@ -164,7 +232,11 @@ pub struct Config {
     #[serde(default)]
     pub manual_queries: Vec<ManualQuery>,
 
-    /// List of omnisharded tables.
+    /// Omnisharded tables are tables that contain the same data on all shards. This is useful for storing relatively static metadata used in joins or data that doesn't fit the sharding schema of the database, e.g., list of countries, global settings, list of blocked IPs, etc.
+    ///
+    /// **Note:** Unless explicitly configured as sharded tables, all tables default to omnisharded status, which makes configuration simpler, and doesn't require explicitly enumerating all tables in `pgdog.toml`.
+    ///
+    /// https://docs.pgdog.dev/features/sharding/omnishards/
     #[serde(default)]
     pub omnisharded_tables: Vec<OmnishardedTables>,
 
@@ -172,6 +244,9 @@ pub struct Config {
     #[serde(default)]
     pub sharded_mappings: Vec<ShardedMapping>,
 
+    /// [Schema-based sharding](https://docs.pgdog.dev/features/sharding/sharding-functions/#schema-based-sharding) places data from tables in different Postgres schemas on their own shards.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/sharded_schemas/
     #[serde(default)]
     pub sharded_schemas: Vec<ShardedSchema>,
 
@@ -183,11 +258,15 @@ pub struct Config {
     #[serde(default)]
     pub replication: Replication,
 
-    /// Mirroring configurations.
+    /// [Mirroring](https://docs.pgdog.dev/features/mirroring/) settings configure traffic mirroring between two databases. When enabled, query traffic is copied from the source database to the destination database, in real time.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/mirroring/
     #[serde(default)]
     pub mirroring: Vec<Mirroring>,
 
-    /// Memory tweaks
+    /// Memory settings control buffer sizes used by PgDog for network I/O and task execution.
+    ///
+    /// https://docs.pgdog.dev/configuration/pgdog.toml/memory/
     #[serde(default)]
     pub memory: Memory,
 }
@@ -196,8 +275,7 @@ impl Config {
     /// Organize all databases by name for quicker retrieval.
     pub fn databases(&self) -> HashMap<String, Vec<Vec<EnumeratedDatabase>>> {
         let mut databases = HashMap::new();
-        let mut number = 0;
-        for database in &self.databases {
+        for (number, database) in self.databases.iter().enumerate() {
             let entry = databases
                 .entry(database.name.clone())
                 .or_insert_with(Vec::new);
@@ -211,7 +289,6 @@ impl Config {
                     number,
                     database: database.clone(),
                 });
-            number += 1;
         }
         databases
     }
@@ -242,6 +319,33 @@ impl Config {
                     name: t.clone(),
                     sticky_routing: table.sticky,
                 });
+            }
+        }
+
+        let databases = self
+            .databases
+            .iter()
+            .map(|database| database.name.clone())
+            .collect::<HashSet<_>>();
+
+        // Automatically configure system catalogs
+        // as omnisharded.
+        if self.general.system_catalogs != SystemCatalogsBehavior::Sharded {
+            let sticky_routing = matches!(
+                self.general.system_catalogs,
+                SystemCatalogsBehavior::OmnishardedSticky
+            );
+            for database in databases {
+                let entry = tables.entry(database).or_insert_with(Vec::new);
+
+                for table in system_catalogs() {
+                    if !entry.iter().any(|t| t.name == *table) {
+                        entry.push(OmnishardedTable {
+                            name: table.to_string(),
+                            sticky_routing,
+                        });
+                    }
+                }
             }
         }
 
@@ -318,6 +422,7 @@ impl Config {
             role: Role,
             role_warned: bool,
             parser_warned: bool,
+            mirror_parser_warned: bool,
             have_replicas: bool,
             sharded: bool,
         }
@@ -365,6 +470,7 @@ impl Config {
                         role: database.role,
                         role_warned: false,
                         parser_warned: false,
+                        mirror_parser_warned: false,
                         have_replicas: database.role == Role::Replica,
                         sharded: database.shard > 0,
                     },
@@ -384,12 +490,12 @@ impl Config {
 
         // Warn about plain auth and TLS
         match self.general.passthrough_auth {
-            PassthoughAuth::Enabled if !self.general.tls_client_required => {
+            PassthroughAuth::Enabled if !self.general.tls_client_required => {
                 warn!(
                     "consider setting \"tls_client_required\" while \"passthrough_auth\" is enabled to prevent clients from exposing plaintext passwords"
                 );
             }
-            PassthoughAuth::EnabledPlain => {
+            PassthroughAuth::EnabledPlain => {
                 warn!(
                     "\"passthrough_auth\" is set to \"plain\", network traffic may expose plaintext passwords"
                 )
@@ -411,7 +517,30 @@ impl Config {
             }
         }
 
-        for (database, check) in checks {
+        for mirror in &self.mirroring {
+            if mirror.level == MirroringLevel::All {
+                continue;
+            }
+            if let Some(check) = checks.get_mut(&mirror.source_db) {
+                if check.mirror_parser_warned {
+                    continue;
+                }
+                let parser_enabled = match self.general.query_parser {
+                    QueryParserLevel::On => true,
+                    QueryParserLevel::Off => false,
+                    QueryParserLevel::Auto => check.have_replicas || check.sharded,
+                };
+                if !parser_enabled {
+                    check.mirror_parser_warned = true;
+                    warn!(
+                        r#"mirroring from "{}" with level "{}" requires the query parser to classify statements, but it won't be enabled, set query_parser = "on""#,
+                        mirror.source_db, mirror.level
+                    );
+                }
+            }
+        }
+
+        for (database, check) in &checks {
             if !check.have_replicas
                 && self.general.read_write_split == ReadWriteSplit::ExcludePrimary
             {
@@ -427,13 +556,13 @@ impl Config {
             self.general.query_parser = QueryParserLevel::On;
         }
 
-        if self.general.query_parser_engine == QueryParserEngine::PgQueryRaw {
-            if self.memory.stack_size < 32 * 1024 * 1024 {
-                self.memory.stack_size = 32 * 1024 * 1024;
-                warn!(
-                    r#""pg_query_raw" parser engine requires a large thread stack, setting it to 32MiB for each Tokio worker"#
-                );
-            }
+        if self.general.query_parser_engine == QueryParserEngine::PgQueryRaw
+            && self.memory.stack_size < 32 * 1024 * 1024
+        {
+            self.memory.stack_size = 32 * 1024 * 1024;
+            warn!(
+                r#""pg_query_raw" parser engine requires a large thread stack, setting it to 32MiB for each Tokio worker"#
+            );
         }
     }
 
@@ -454,6 +583,7 @@ impl Config {
             .map(|m| MirrorConfig {
                 queue_length: m.queue_length.unwrap_or(self.general.mirror_queue),
                 exposure: m.exposure.unwrap_or(self.general.mirror_exposure),
+                level: m.level,
             })
     }
 
@@ -465,6 +595,7 @@ impl Config {
             let config = MirrorConfig {
                 queue_length: mirror.queue_length.unwrap_or(self.general.mirror_queue),
                 exposure: mirror.exposure.unwrap_or(self.general.mirror_exposure),
+                level: mirror.level,
             };
 
             result
@@ -474,6 +605,49 @@ impl Config {
         }
 
         result
+    }
+
+    /// Swap database configs between `source` and `destination`.
+    /// Uses tmp pattern: source -> tmp, destination -> source, tmp -> destination.
+    pub fn cutover(&mut self, source: &str, destination: &str) {
+        let tmp = format!("__tmp_{}__", random_string(12));
+
+        crate::swap_field!(self.databases.iter_mut(), name, source, destination, tmp);
+        crate::swap_field!(
+            self.sharded_mappings.iter_mut(),
+            database,
+            source,
+            destination,
+            tmp
+        );
+        crate::swap_field!(
+            self.sharded_tables.iter_mut(),
+            database,
+            source,
+            destination,
+            tmp
+        );
+        crate::swap_field!(
+            self.omnisharded_tables.iter_mut(),
+            database,
+            source,
+            destination,
+            tmp
+        );
+        crate::swap_field!(
+            self.mirroring.iter_mut(),
+            source_db,
+            source,
+            destination,
+            tmp
+        );
+        crate::swap_field!(
+            self.mirroring.iter_mut(),
+            destination_db,
+            source,
+            destination,
+            tmp
+        );
     }
 }
 
@@ -729,6 +903,7 @@ password = "users_admin_password"
 [general]
 host = "0.0.0.0"
 port = 6432
+system_catalogs = "sharded"
 
 [[databases]]
 name = "db1"
@@ -775,5 +950,377 @@ tables = ["table_x"]
         assert_eq!(db2_tables.len(), 1);
         assert_eq!(db2_tables[0].name, "table_x");
         assert!(!db2_tables[0].sticky_routing);
+    }
+
+    #[test]
+    fn test_omnisharded_tables_system_catalogs() {
+        // Test with system_catalogs_omnisharded = true
+        let source_enabled = r#"
+[general]
+host = "0.0.0.0"
+port = 6432
+system_catalogs = "omnisharded_sticky"
+
+[[databases]]
+name = "db1"
+host = "127.0.0.1"
+port = 5432
+
+[[omnisharded_tables]]
+database = "db1"
+tables = ["my_table"]
+"#;
+
+        let config: Config = toml::from_str(source_enabled).unwrap();
+        let tables = config.omnisharded_tables();
+        let db1_tables = tables.get("db1").unwrap();
+
+        // Should include my_table plus system catalogs
+        assert!(db1_tables.iter().any(|t| t.name == "my_table"));
+        assert!(db1_tables.iter().any(|t| t.name == "pg_class"));
+        assert!(db1_tables.iter().any(|t| t.name == "pg_attribute"));
+        assert!(db1_tables.iter().any(|t| t.name == "pg_namespace"));
+        assert!(db1_tables.iter().any(|t| t.name == "pg_type"));
+
+        // System catalogs should have sticky_routing = true
+        let pg_class = db1_tables.iter().find(|t| t.name == "pg_class").unwrap();
+        assert!(pg_class.sticky_routing);
+
+        // Test with system_catalogs = "sharded" (no omnisharding)
+        let source_disabled = r#"
+[general]
+host = "0.0.0.0"
+port = 6432
+system_catalogs = "sharded"
+
+[[databases]]
+name = "db1"
+host = "127.0.0.1"
+port = 5432
+
+[[omnisharded_tables]]
+database = "db1"
+tables = ["my_table"]
+"#;
+
+        let config: Config = toml::from_str(source_disabled).unwrap();
+        let tables = config.omnisharded_tables();
+        let db1_tables = tables.get("db1").unwrap();
+
+        // Should only include my_table, no system catalogs
+        assert_eq!(db1_tables.len(), 1);
+        assert_eq!(db1_tables[0].name, "my_table");
+        assert!(!db1_tables.iter().any(|t| t.name == "pg_class"));
+        assert!(!db1_tables.iter().any(|t| t.name == "pg_attribute"));
+    }
+
+    #[test]
+    fn test_cutover_swaps_database_configs() {
+        let mut config = Config {
+            databases: vec![
+                Database {
+                    name: "source_db".to_string(),
+                    host: "source-host".to_string(),
+                    port: 5432,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+                Database {
+                    name: "destination_db".to_string(),
+                    host: "destination-host".to_string(),
+                    port: 5433,
+                    role: Role::Primary,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        // After cutover: looking up source_db returns destination's config
+        config.cutover("source_db", "destination_db");
+
+        assert_eq!(config.databases.len(), 2);
+
+        // source_db should now have destination's config (host, port)
+        let source = config
+            .databases
+            .iter()
+            .find(|d| d.name == "source_db")
+            .unwrap();
+        assert_eq!(
+            source.host, "destination-host",
+            "source_db should now have destination's host after cutover"
+        );
+        assert_eq!(
+            source.port, 5433,
+            "source_db should now have destination's port after cutover"
+        );
+
+        // destination_db should now have source's config (host, port)
+        let destination = config
+            .databases
+            .iter()
+            .find(|d| d.name == "destination_db")
+            .unwrap();
+        assert_eq!(
+            destination.host, "source-host",
+            "destination_db should now have source's host after cutover"
+        );
+        assert_eq!(
+            destination.port, 5432,
+            "destination_db should now have source's port after cutover"
+        );
+    }
+
+    #[test]
+    fn test_cutover_visual() {
+        let before = r#"
+[[databases]]
+name = "source_db"
+host = "source-host-0"
+port = 5432
+role = "primary"
+shard = 0
+
+[[databases]]
+name = "source_db"
+host = "source-host-0-replica"
+port = 5432
+role = "replica"
+shard = 0
+
+[[databases]]
+name = "source_db"
+host = "source-host-1"
+port = 5432
+role = "primary"
+shard = 1
+
+[[databases]]
+name = "source_db"
+host = "source-host-1-replica"
+port = 5432
+role = "replica"
+shard = 1
+
+[[databases]]
+name = "destination_db"
+host = "destination-host-0"
+port = 5433
+role = "primary"
+shard = 0
+
+[[databases]]
+name = "destination_db"
+host = "destination-host-0-replica"
+port = 5433
+role = "replica"
+shard = 0
+
+[[databases]]
+name = "destination_db"
+host = "destination-host-1"
+port = 5433
+role = "primary"
+shard = 1
+
+[[databases]]
+name = "destination_db"
+host = "destination-host-1-replica"
+port = 5433
+role = "replica"
+shard = 1
+
+[[sharded_tables]]
+database = "source_db"
+name = "users"
+column = "id"
+
+[[sharded_tables]]
+database = "destination_db"
+name = "users"
+column = "id"
+
+[[mirroring]]
+source_db = "source_db"
+destination_db = "destination_db"
+"#;
+
+        // After name swap: elements stay in place, only names change
+        // Original source_db entries become destination_db (keeping source's host)
+        // Original destination_db entries become source_db (keeping destination's host)
+        let expected_after = r#"
+[[databases]]
+name = "destination_db"
+host = "source-host-0"
+port = 5432
+role = "primary"
+shard = 0
+
+[[databases]]
+name = "destination_db"
+host = "source-host-0-replica"
+port = 5432
+role = "replica"
+shard = 0
+
+[[databases]]
+name = "destination_db"
+host = "source-host-1"
+port = 5432
+role = "primary"
+shard = 1
+
+[[databases]]
+name = "destination_db"
+host = "source-host-1-replica"
+port = 5432
+role = "replica"
+shard = 1
+
+[[databases]]
+name = "source_db"
+host = "destination-host-0"
+port = 5433
+role = "primary"
+shard = 0
+
+[[databases]]
+name = "source_db"
+host = "destination-host-0-replica"
+port = 5433
+role = "replica"
+shard = 0
+
+[[databases]]
+name = "source_db"
+host = "destination-host-1"
+port = 5433
+role = "primary"
+shard = 1
+
+[[databases]]
+name = "source_db"
+host = "destination-host-1-replica"
+port = 5433
+role = "replica"
+shard = 1
+
+[[sharded_tables]]
+database = "destination_db"
+name = "users"
+column = "id"
+
+[[sharded_tables]]
+database = "source_db"
+name = "users"
+column = "id"
+
+[[mirroring]]
+source_db = "destination_db"
+destination_db = "source_db"
+"#;
+
+        let mut config: Config = toml::from_str(before).unwrap();
+        config.cutover("source_db", "destination_db");
+
+        let expected: Config = toml::from_str(expected_after).unwrap();
+
+        assert_eq!(config.databases, expected.databases);
+        assert_eq!(config.sharded_tables, expected.sharded_tables);
+        assert_eq!(config.mirroring, expected.mirroring);
+    }
+
+    #[test]
+    fn test_cutover_backup_roundtrip() {
+        let original_toml = r#"
+[[databases]]
+name = "source_db"
+host = "source-host"
+port = 5432
+role = "primary"
+shard = 0
+
+[[databases]]
+name = "destination_db"
+host = "destination-host"
+port = 5433
+role = "primary"
+shard = 0
+"#;
+
+        // Parse original config
+        let original: Config = toml::from_str(original_toml).unwrap();
+
+        // Simulate backup: serialize original to TOML
+        let backup_toml = toml::to_string_pretty(&original).unwrap();
+
+        // Perform cutover
+        let mut config = original.clone();
+        config.cutover("source_db", "destination_db");
+
+        // Serialize cutover result (what would be written to disk)
+        let new_toml = toml::to_string_pretty(&config).unwrap();
+
+        // Verify backup can be parsed back and matches original
+        let restored_backup: Config = toml::from_str(&backup_toml).unwrap();
+        assert_eq!(restored_backup.databases, original.databases);
+
+        // Verify new config can be parsed back and has swapped values
+        let restored_new: Config = toml::from_str(&new_toml).unwrap();
+
+        // After cutover: source_db should have destination's host
+        let source = restored_new
+            .databases
+            .iter()
+            .find(|d| d.name == "source_db")
+            .unwrap();
+        assert_eq!(source.host, "destination-host");
+        assert_eq!(source.port, 5433);
+
+        // After cutover: destination_db should have source's host
+        let dest = restored_new
+            .databases
+            .iter()
+            .find(|d| d.name == "destination_db")
+            .unwrap();
+        assert_eq!(dest.host, "source-host");
+        assert_eq!(dest.port, 5432);
+    }
+
+    #[test]
+    fn test_rds_iam_rejects_passthrough_auth() {
+        let mut config = ConfigAndUsers::default();
+        config.config.general.passthrough_auth = PassthroughAuth::EnabledPlain;
+        config.config.general.tls_verify = TlsVerifyMode::VerifyFull;
+        config.users.users.push(crate::User {
+            name: "alice".into(),
+            database: "db".into(),
+            password: Some("secret".into()),
+            server_auth: ServerAuth::RdsIam,
+            ..Default::default()
+        });
+
+        let err = config.check().unwrap_err().to_string();
+        assert!(err.contains("passthrough_auth"));
+        assert!(err.contains("rds_iam"));
+    }
+
+    #[test]
+    fn test_rds_iam_rejects_tls_verify_disabled() {
+        let mut config = ConfigAndUsers::default();
+        config.config.general.tls_verify = TlsVerifyMode::Disabled;
+        config.config.general.passthrough_auth = PassthroughAuth::Disabled;
+        config.users.users.push(crate::User {
+            name: "alice".into(),
+            database: "db".into(),
+            password: Some("secret".into()),
+            server_auth: ServerAuth::RdsIam,
+            ..Default::default()
+        });
+
+        let err = config.check().unwrap_err().to_string();
+        assert!(err.contains("tls_verify"));
+        assert!(err.contains("rds_iam"));
     }
 }

@@ -136,7 +136,11 @@ impl Binding {
                 let mut shards_sent = servers.len();
                 let mut futures = Vec::new();
 
-                for (shard, server) in servers.iter_mut().enumerate() {
+                for (position, server) in servers.iter_mut().enumerate() {
+                    // Map positional index to actual shard number.
+                    // When only a subset of shards is connected (Shard::Multi binding),
+                    // positional indices don't match actual shard numbers.
+                    let shard = state.shard_index(position);
                     let send = match client_request.route().shard() {
                         Shard::Direct(s) => {
                             shards_sent = 1;
@@ -160,7 +164,14 @@ impl Binding {
                     result?;
                 }
 
-                state.update(shards_sent, client_request.route());
+                // For Sync-only requests, update shards count but don't reset counters.
+                // Sync needs correct shards for ReadyForQuery counting, but we must
+                // preserve buffered CommandComplete from previous queries.
+                if client_request.is_sync_only() {
+                    state.update_shards(shards_sent);
+                } else {
+                    state.update(shards_sent, client_request.route());
+                }
 
                 Ok(())
             }
@@ -170,9 +181,10 @@ impl Binding {
     /// Send copy messages to shards they are destined to go.
     pub async fn send_copy(&mut self, rows: Vec<CopyRow>) -> Result<(), Error> {
         match self {
-            Binding::MultiShard(servers, _state) => {
+            Binding::MultiShard(servers, state) => {
                 for row in rows {
-                    for (shard, server) in servers.iter_mut().enumerate() {
+                    for (position, server) in servers.iter_mut().enumerate() {
+                        let shard = state.shard_index(position);
                         match row.shard() {
                             Shard::Direct(row_shard) => {
                                 if shard == *row_shard {
@@ -233,19 +245,32 @@ impl Binding {
         }
     }
 
+    /// Protocol is out of sync due to an error in extended protocol.
+    pub fn out_of_sync(&self) -> bool {
+        match self {
+            Binding::Direct(Some(server)) => server.out_of_sync(),
+            Binding::MultiShard(servers, _state) => servers.iter().any(|s| s.out_of_sync()),
+            _ => false,
+        }
+    }
+
     pub(super) fn state_check(&self, state: State) -> bool {
         match self {
             Binding::Direct(Some(server)) => {
                 debug!(
                     "server is in \"{}\" state [{}]",
-                    server.stats().state,
+                    server.stats().get_state(),
                     server.addr()
                 );
-                server.stats().state == state
+                server.stats().get_state() == state
             }
             Binding::MultiShard(servers, _) => servers.iter().all(|s| {
-                debug!("server is in \"{}\" state [{}]", s.stats().state, s.addr());
-                s.stats().state == state
+                debug!(
+                    "server is in \"{}\" state [{}]",
+                    s.stats().get_state(),
+                    s.addr()
+                );
+                s.stats().get_state() == state
             }),
             _ => true,
         }

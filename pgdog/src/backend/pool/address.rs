@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::backend::{pool::dns_cache::DnsCache, Error};
-use crate::config::{config, Database, User};
+use crate::config::{config, Database, ServerAuth, User};
 
 /// Server address.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Eq, Hash)]
 pub struct Address {
     /// Server host.
     pub host: String,
@@ -19,14 +19,36 @@ pub struct Address {
     /// Username.
     pub user: String,
     /// Password.
-    pub password: String,
+    pub passwords: Vec<String>,
+    /// Server auth mode for backend connections.
+    #[serde(default)]
+    pub server_auth: ServerAuth,
+    /// Optional IAM region override.
+    pub server_iam_region: Option<String>,
     /// Database number (in the config).
     pub database_number: usize,
+}
+
+impl From<Address> for pgdog_stats::Address {
+    fn from(value: Address) -> Self {
+        pgdog_stats::Address {
+            host: value.host,
+            port: value.port,
+            database_name: value.database_name,
+            user: value.user,
+            passwords: value.passwords.clone(),
+            server_auth: value.server_auth,
+            server_iam_region: value.server_iam_region,
+            database_number: value.database_number,
+        }
+    }
 }
 
 impl Address {
     /// Create new address from config values.
     pub fn new(database: &Database, user: &User, database_number: usize) -> Self {
+        let server_auth = user.server_auth;
+
         Address {
             host: database.host.clone(),
             port: database.port,
@@ -42,14 +64,25 @@ impl Address {
             } else {
                 user.name.clone()
             },
-            password: if let Some(password) = database.password.clone() {
-                password
+            passwords: if server_auth.rds_iam() {
+                vec![]
+            } else if let Some(password) = database.password.clone() {
+                vec![password]
             } else if let Some(password) = user.server_password.clone() {
-                password
+                vec![password]
             } else {
-                user.password().to_string()
+                user.passwords()
             },
+            server_auth,
+            server_iam_region: user.server_iam_region.clone(),
             database_number,
+        }
+    }
+
+    pub async fn auth_secrets(&self) -> Result<Vec<String>, Error> {
+        match self.server_auth {
+            ServerAuth::Password => Ok(self.passwords.clone()),
+            ServerAuth::RdsIam => Ok(vec![crate::backend::auth::rds_iam::token(self).await?]),
         }
     }
 
@@ -75,8 +108,10 @@ impl Address {
             host: "127.0.0.1".into(),
             port: 5432,
             user: "pgdog".into(),
-            password: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
             database_name: "pgdog".into(),
+            server_auth: ServerAuth::Password,
+            server_iam_region: None,
             database_number: 0,
         }
     }
@@ -105,9 +140,11 @@ impl TryFrom<Url> for Address {
         Ok(Self {
             host,
             port,
-            password,
+            passwords: vec![password],
             user,
             database_name,
+            server_auth: ServerAuth::Password,
+            server_iam_region: None,
             database_number: 0,
         })
     }
@@ -139,7 +176,7 @@ mod test {
         assert_eq!(address.port, 6432);
         assert_eq!(address.database_name, "pgdog");
         assert_eq!(address.user, "pgdog");
-        assert_eq!(address.password, "hunter2");
+        assert_eq!(address.passwords.first().unwrap(), "hunter2");
 
         database.database_name = Some("not_pgdog".into());
         database.password = Some("hunter3".into());
@@ -149,7 +186,36 @@ mod test {
 
         assert_eq!(address.database_name, "not_pgdog");
         assert_eq!(address.user, "alice");
-        assert_eq!(address.password, "hunter3");
+        assert_eq!(address.passwords.first().unwrap(), "hunter3");
+    }
+
+    #[test]
+    fn test_rds_iam_does_not_use_static_password() {
+        let database = Database {
+            name: "pgdog".into(),
+            host: "127.0.0.1".into(),
+            port: 6432,
+            password: Some("db-level-pass".into()),
+            ..Default::default()
+        };
+
+        let user = User {
+            name: "pgdog".into(),
+            password: Some("user-pass".into()),
+            server_password: Some("server-pass".into()),
+            server_auth: ServerAuth::RdsIam,
+            server_iam_region: Some("us-east-1".into()),
+            database: "pgdog".into(),
+            ..Default::default()
+        };
+
+        let address = Address::new(&database, &user, 0);
+        assert!(
+            address.passwords.is_empty(),
+            "RDS IAM addresses must not carry static passwords"
+        );
+        assert_eq!(address.server_auth, ServerAuth::RdsIam);
+        assert_eq!(address.server_iam_region.as_deref(), Some("us-east-1"));
     }
 
     #[test]
@@ -161,6 +227,34 @@ mod test {
         assert_eq!(addr.port, 6432);
         assert_eq!(addr.database_name, "pgdb");
         assert_eq!(addr.user, "user");
-        assert_eq!(addr.password, "password");
+        assert_eq!(addr.passwords.first().unwrap(), "password");
+        assert_eq!(addr.server_auth, ServerAuth::Password);
+        assert!(addr.server_iam_region.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auth_secret_password_mode() {
+        let addr = Address::new_test();
+        assert_eq!(addr.auth_secrets().await.unwrap().first().unwrap(), "pgdog");
+    }
+
+    #[tokio::test]
+    async fn test_auth_secret_rds_iam_mode_uses_generator() {
+        let mut addr = Address::new_test();
+        addr.server_auth = ServerAuth::RdsIam;
+        addr.server_iam_region = Some("us-east-1".into());
+        addr.passwords = vec!["wrong".into()];
+
+        crate::backend::auth::rds_iam::set_test_token_override(Some("token-from-iam".into()));
+        let secret = addr
+            .auth_secrets()
+            .await
+            .unwrap()
+            .first()
+            .unwrap()
+            .to_string();
+        crate::backend::auth::rds_iam::set_test_token_override(None);
+
+        assert_eq!(secret, "token-from-iam");
     }
 }

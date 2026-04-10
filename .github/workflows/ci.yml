@@ -62,6 +62,7 @@ jobs:
           sudo -u postgres createuser --superuser --login $USER
           sudo -u postgres createdb $USER
           sudo -u postgres psql -c 'ALTER SYSTEM SET max_prepared_transactions TO 1000;'
+          sudo -u postgres psql -c 'ALTER SYSTEM SET wal_level TO logical;'
           sudo service postgresql restart
           bash integration/setup.sh
           sudo apt update && sudo apt install -y python3-virtualenv mold
@@ -80,7 +81,7 @@ jobs:
           RUSTFLAGS: "-C link-dead-code"
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov nextest --lcov --output-path lcov.info --no-fail-fast --test-threads=1 --filter-expr "package(pgdog) | package(pgdog-config) | package(pgdog-vector)"
+          cargo llvm-cov nextest --lcov --output-path lcov.info --no-fail-fast --test-threads=1 --filter-expr "package(pgdog) | package(pgdog-config) | package(pgdog-vector) | package(pgdog-stats) | package(pgdog-postgres-types)"
       - name: Run documentation tests
         run: cargo test --doc
       # Requires CODECOV_TOKEN secret for upload
@@ -116,7 +117,7 @@ jobs:
           sudo -u postgres psql -c 'ALTER SYSTEM SET wal_level TO logical;'
           sudo service postgresql restart
           bash integration/setup.sh
-          sudo apt update && sudo apt install -y python3-virtualenv mold
+          sudo apt update && sudo apt install -y python3-virtualenv mold php-cli php-pgsql
           sudo gem install bundler
           sudo apt remove -y cmake
           sudo pip3 install cmake==3.31.6
@@ -156,6 +157,8 @@ jobs:
         run: bash integration/ruby/run.sh
       - name: Java
         run: bash integration/java/run.sh
+      - name: Mirror
+        run: bash integration/mirror/run.sh
       - name: SQL
         run: bash integration/sql/run.sh
       - name: Toxi

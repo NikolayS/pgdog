@@ -15,25 +15,6 @@ CREATE TABLE IF NOT EXISTS copy_data.users_0 PARTITION OF copy_data.users
 CREATE TABLE IF NOT EXISTS copy_data.users_1 PARTITION OF copy_data.users
     FOR VALUES WITH (MODULUS 2, REMAINDER 1);
 
-TRUNCATE TABLE copy_data.users;
-
-INSERT INTO copy_data.users (id, tenant_id, email, created_at, settings)
-SELECT
-    gs.id,
-    ((gs.id - 1) % 20) + 1 AS tenant_id,  -- distribute across 20 tenants
-    format('user_%s_tenant_%s@example.com', gs.id, ((gs.id - 1) % 20) + 1) AS email,
-    NOW() - (random() * interval '365 days') AS created_at,  -- random past date
-    jsonb_build_object(
-        'theme', CASE (random() * 3)::int
-                    WHEN 0 THEN 'light'
-                    WHEN 1 THEN 'dark'
-                    ELSE 'auto'
-                    END,
-        'notifications', (random() > 0.5)
-    ) AS settings
-FROM generate_series(1, 10000) AS gs(id);
-
-DROP TABLE copy_data.orders;
 CREATE TABLE IF NOT EXISTS copy_data.orders (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL,
@@ -52,10 +33,65 @@ CREATE TABLE IF NOT EXISTS copy_data.order_items (
     refunded_at TIMESTAMPTZ
 );
 
--- --- Fix/define schema (safe to run if you're starting fresh) ---
--- Adjust/drop statements as needed if the tables already exist.
-TRUNCATE TABLE copy_data.order_items CASCADE;
-TRUNCATE TABLE copy_data.orders CASCADE;
+CREATE TABLE IF NOT EXISTS copy_data.log_actions(
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT,
+    action VARCHAR,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE copy_data.with_identity(
+    id BIGINT PRIMARY KEY GENERATED ALWAYS AS identity,
+    tenant_id BIGINT NOT NULL
+);
+
+
+-- Omni (non-sharded) tables: no tenant_id column.
+CREATE TABLE IF NOT EXISTS copy_data.countries (
+    id BIGSERIAL PRIMARY KEY,
+    code VARCHAR NOT NULL UNIQUE,
+    name VARCHAR NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS copy_data.currencies (
+    id BIGSERIAL PRIMARY KEY,
+    code VARCHAR NOT NULL UNIQUE,
+    name VARCHAR NOT NULL,
+    symbol VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS copy_data.categories (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    parent_id INT
+);
+
+CREATE TABLE copy_data.settings (
+    id BIGSERIAL PRIMARY KEY,
+    setting_name TEXT NOT NULL UNIQUE,
+    setting_value TEXT NOT NULL
+);
+
+DROP PUBLICATION IF EXISTS pgdog;
+CREATE PUBLICATION pgdog FOR TABLES IN SCHEMA copy_data;
+
+
+INSERT INTO copy_data.users (id, tenant_id, email, created_at, settings)
+SELECT
+    gs.id,
+    ((gs.id - 1) % 20) + 1 AS tenant_id,  -- distribute across 20 tenants
+    format('user_%s_tenant_%s@example.com', gs.id, ((gs.id - 1) % 20) + 1) AS email,
+    NOW() - (random() * interval '365 days') AS created_at,  -- random past date
+    jsonb_build_object(
+        'theme', CASE (random() * 3)::int
+                    WHEN 0 THEN 'light'
+                    WHEN 1 THEN 'dark'
+                    ELSE 'auto'
+                    END,
+        'notifications', (random() > 0.5)
+    ) AS settings
+FROM generate_series(1, 10000) AS gs(id);
+
 
 WITH u AS (
   -- Pull the 10k users we inserted earlier
@@ -134,28 +170,31 @@ SELECT
     ir.item_refunded_at
 FROM items_raw ir;
 
-CREATE TABLE copy_data.log_actions(
-    id BIGSERIAL PRIMARY KEY,
-    tenant_id BIGINT,
-    action VARCHAR,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
 INSERT INTO copy_data.log_actions (tenant_id, action)
 SELECT
-    CASE WHEN random() < 0.2 THEN NULL ELSE (floor(random() * 10000) + 1)::bigint END AS tenant_id,
+    (floor(random() * 10000) + 1)::bigint AS tenant_id,
     (ARRAY['login', 'logout', 'click', 'purchase', 'view', 'error'])[
         floor(random() * 6 + 1)::int
     ] AS action
 FROM generate_series(1, 10000);
 
-CREATE TABLE copy_data.with_identity(
-    id BIGINT GENERATED ALWAYS AS identity,
-    tenant_id BIGINT NOT NULL
-);
 
 INSERT INTO copy_data.with_identity (tenant_id)
 SELECT floor(random() * 10000)::bigint FROM generate_series(1, 10000);
 
-DROP PUBLICATION IF EXISTS pgdog;
-CREATE PUBLICATION pgdog FOR TABLES IN SCHEMA copy_data;
+INSERT INTO copy_data.countries (code, name) VALUES
+    ('US', 'United States'), ('GB', 'United Kingdom'), ('DE', 'Germany'),
+    ('FR', 'France'), ('JP', 'Japan'), ('CA', 'Canada'),
+    ('AU', 'Australia'), ('BR', 'Brazil'), ('IN', 'India'), ('CN', 'China');
+
+INSERT INTO copy_data.currencies (code, name, symbol) VALUES
+    ('USD', 'US Dollar', '$'), ('EUR', 'Euro', '€'), ('GBP', 'British Pound', '£'),
+    ('JPY', 'Japanese Yen', '¥'), ('CAD', 'Canadian Dollar', 'C$'),
+    ('AUD', 'Australian Dollar', 'A$'), ('BRL', 'Brazilian Real', 'R$'),
+    ('INR', 'Indian Rupee', '₹'), ('CNY', 'Chinese Yuan', '¥'), ('CHF', 'Swiss Franc', 'Fr');
+
+INSERT INTO copy_data.categories (name, parent_id) VALUES
+    ('Electronics', NULL), ('Clothing', NULL), ('Books', NULL),
+    ('Home & Garden', NULL), ('Sports', NULL);
+INSERT INTO copy_data.categories (name, parent_id) VALUES
+    ('Phones', 1), ('Laptops', 1), ('Shirts', 2), ('Pants', 2), ('Fiction', 3);

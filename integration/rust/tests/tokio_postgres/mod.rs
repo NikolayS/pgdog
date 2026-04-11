@@ -1,4 +1,12 @@
+pub mod arrays;
+pub mod concurrent_prepared;
 pub mod copy;
+pub mod copy_extended;
+pub mod error_recovery;
+pub mod large_binary;
+pub mod mixed_protocol;
 pub mod nulls;
+pub mod pipelining;
 pub mod prepared;
+pub mod rapid_connect;
 pub mod select;
